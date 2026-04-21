@@ -21,3 +21,12 @@ wrist_temp.csv,TEMP,0.25s,La temperatura viene letta 4 volte al secondo (4Hz).
 
 #PUNTO 2
 Installare SQLite Viewer (da Exstension su VisualStudioCode) per visualizzare il database nel quale vengono salvati i dati in tempo reale.
+
+#PUNTO 3. 
+
+Apriamo più terminali:
+python server.py
+python sensor_pt3.py C:\Users\galli\OneDrive\Desktop\fatigueset\fatigueset\01
+python sensor_pt3.py C:\Users\galli\OneDrive\Desktop\fatigueset\fatigueset\05 
+
+"Inserire dinamicamente un client" significa che se io apro due terminali diversi e lancio lo script due volte su due cartelle diverse, il server deve essere in grado di gestirli contemporaneamente senza confondersi.
