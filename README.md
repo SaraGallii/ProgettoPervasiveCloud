@@ -5,6 +5,8 @@ Aprire due terminali in contemporanea e digitare:
 python sensor.py (client)
 python server.py (server)
 
+http://127.0.0.1:5000/data
+
 #FUNZIONAMENTO HTTP. PUNTO 1
 La comunicazione avviene tramite HTTP (HyperText Transfer Protocol).Nel Client (sensor.py) il protocollo è rappresentato dalla libreria requests. Quando si scrive requests.post(...), s sta inviando un "pacchetto" HTTP di tipo POST (usato per inviare dati) verso il server.
 Nel Server (server.py) il protocollo è gestito da Flask. Flask rimane "in ascolto" sulla porta 5000 aspettando messaggi che seguano le regole dell'HTTP.
@@ -30,3 +32,10 @@ python sensor_pt3.py C:\Users\galli\OneDrive\Desktop\fatigueset\fatigueset\01
 python sensor_pt3.py C:\Users\galli\OneDrive\Desktop\fatigueset\fatigueset\05 
 
 "Inserire dinamicamente un client" significa che se io apro due terminali diversi e lancio lo script due volte su due cartelle diverse, il server deve essere in grado di gestirli contemporaneamente senza confondersi.
+
+#PUNTO 4
+python sensor.py
+python server_pt4.py
+http://127.0.0.1:5000/login
+
+Allooora i dati inseriti nei grafici sono ordinati per timestamp
