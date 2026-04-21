@@ -27,9 +27,16 @@ Installare SQLite Viewer (da Exstension su VisualStudioCode) per visualizzare il
 #PUNTO 3. 
 
 Apriamo più terminali:
+
+CON PERCORSO ASSOLUTO
 python server.py
 python sensor_pt3.py C:\Users\galli\OneDrive\Desktop\fatigueset\fatigueset\01
 python sensor_pt3.py C:\Users\galli\OneDrive\Desktop\fatigueset\fatigueset\05 
+
+CON PERCORSO RELATIVO
+python server.py
+python sensor_pt3.py fatigueset\01
+python sensor_pt3.py fatigueset\02
 
 "Inserire dinamicamente un client" significa che se io apro due terminali diversi e lancio lo script due volte su due cartelle diverse, il server deve essere in grado di gestirli contemporaneamente senza confondersi.
 

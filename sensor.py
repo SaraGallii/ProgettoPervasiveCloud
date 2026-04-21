@@ -73,5 +73,10 @@ def avvia_simulazione_globale(base_dir, server_url):
 
 if __name__ == "__main__":
     SERVER_URL = "http://127.0.0.1:5000/data"
-    DATASET_PATH = r"C:\Users\galli\OneDrive\Desktop\fatigueset"  
+    # Percorso assoluto
+    # DATASET_PATH = r"C:\Users\galli\OneDrive\Desktop\fatigueset"  
+
+    # Percorso relativo
+    DATASET_PATH = r"fatigueset"
+    
     avvia_simulazione_globale(DATASET_PATH, SERVER_URL)

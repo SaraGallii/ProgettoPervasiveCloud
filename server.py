@@ -1,12 +1,17 @@
 from flask import Flask, request, jsonify
 from datetime import datetime
 import sqlite3
+import os
 
 app = Flask(__name__)
 
 ultimo_dato = {}
 
 def init_db():
+    # Se il database esiste già all'avvio, allora viene cancellato e reinizializzato
+    if os.path.exists('Empatica_E4_wristband.db'):
+        os.remove('Empatica_E4_wristband.db')
+
     conn = sqlite3.connect('Empatica_E4_wristband.db')
     cursor = conn.cursor()
     cursor.execute('''
