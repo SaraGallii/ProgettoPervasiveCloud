@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify, session, redirect, url_for, render_te
 from datetime import datetime
 import sqlite3
 import json
+import math
 
 app = Flask(__name__)
 app.secret_key = "p4ssw0rd" 
@@ -112,16 +113,18 @@ def dashboard():
         labels = [r[0] for r in rows]
         
         if s == "ACC":
-            ax, ay, az = [], [], []
+            magnitudes = []
             for r in rows:
                 try:
                     val = json.loads(r[1].replace("'", '"'))
-                    ax.append(float(val.get('ax', val.get('x', 0))))
-                    ay.append(float(val.get('ay', val.get('y', 0))))
-                    az.append(float(val.get('az', val.get('z', 0))))
+                    ax = float(val.get('ax', val.get('x', 0)))
+                    ay = float(val.get('ay', val.get('y', 0)))
+                    az = float(val.get('az', val.get('z', 0)))
+                    mag = math.sqrt(ax**2 + ay**2 + az**2)
+                    magnitudes.append(round(mag, 3))
                 except:
-                    ax.append(0); ay.append(0); az.append(0)
-            data_charts[s] = {"ax": ax, "ay": ay, "az": az, "labels": labels}
+                    magnitudes.append(0)
+            data_charts[s] = {"labels": labels, "values": magnitudes}
         else:
             values = []
             for r in rows:
@@ -139,7 +142,6 @@ def dashboard():
         <head>
             <title>Empatica E4 wristband Dashboard</title>
             <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-            <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
             <style>
                 body { font-family: 'Segoe UI', sans-serif; background: #f0f2f5; margin: 0; padding: 20px; }
                 .container { max-width: 900px; margin: auto; }
@@ -171,7 +173,7 @@ def dashboard():
                     <div>
                         <label> Sensore: </label>
                         <select id="sensorSelect" onchange="updateFilters()">
-                            <option value="ACC">Accelerometro (3D)</option>
+                            <option value="ACC">Accelerazione</option>
                             <option value="BVP">BVP (Pulsazioni)</option>
                             <option value="EDA">EDA (Sudorazione)</option>
                             <option value="HR">Heart Rate (BPM)</option>
@@ -183,9 +185,9 @@ def dashboard():
 
                 {% for s in ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"] %}
                 <div id="card-{{ s }}" class="chart-card">
-                    <h3 style="color:#5f6368; font-size:0.9em; margin-top:0;">{{ s }} - UTENTE: {{ selected_u }}</h3>
+                    <h3 id="title-{{ s }}" style="font-size:0.9em; margin-top:0;">{{ s }} - UTENTE: {{ selected_u }}</h3>
                     <div id="plot-area-{{ s }}" style="flex-grow:1; position:relative;">
-                        {% if s != "ACC" %}<canvas id="chart-{{ s }}"></canvas>{% endif %}
+                        <canvas id="chart-{{ s }}"></canvas>
                     </div>
                 </div>
                 {% endfor %}
@@ -196,51 +198,64 @@ def dashboard():
                 const currentU = "{{ selected_u }}";
                 const currentS = localStorage.getItem('activeSensor') || 'ACC';
 
-                // Imposta select al valore corrente
+                const sensorConfig = {
+                    "ACC": { color: "#e67e22", pointColor: "#d35400", label: "Modulo Accelerazione" },
+                    "BVP": { color: "#3498db", pointColor: "#2980b9", label: "BVP (Blood Volume Pulse)" },
+                    "EDA": { color: "#2ecc71", pointColor: "#27ae60", label: "EDA (Electrodermal Activity)" },
+                    "HR":  { color: "#e74c3c", pointColor: "#c0392b", label: "Heart Rate (BPM)" },
+                    "IBI": { color: "#9b59b6", pointColor: "#8e44ad", label: "IBI (Inter-beat Interval)" },
+                    "TEMP":{ color: "#f1c40f", pointColor: "#f39c12", label: "Temperatura (°C)" }
+                };
+
                 document.getElementById('sensorSelect').value = currentS;
                 const activeCard = document.getElementById('card-' + currentS);
                 if(activeCard) activeCard.classList.add('active');
 
-                // --- GESTIONE GRAFICI ---
-                if (currentS === "ACC") {
-                    // Visualizzazione 3D con Plotly
-                    const trace = {
-                        x: dataCharts.ACC.ax,
-                        y: dataCharts.ACC.ay,
-                        z: dataCharts.ACC.az,
-                        mode: 'markers+lines',
-                        marker: { size: 4, color: '#1a73e8', opacity: 0.8 },
-                        line: { color: '#1a73e8', width: 2 },
-                        type: 'scatter3d'
-                    };
-                    const layout = {
-                        scene: {
-                            xaxis: {title: 'AX'},
-                            yaxis: {title: 'AY'},
-                            zaxis: {title: 'AZ'}
+                const activeTitle = document.getElementById('title-' + currentS);
+                if(activeTitle) activeTitle.style.color = sensorConfig[currentS].color;
+
+                const ctx = document.getElementById('chart-' + currentS).getContext('2d');
+                const config = sensorConfig[currentS];
+
+                new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels: dataCharts[currentS].labels,
+                        datasets: [{
+                            label: config.label,
+                            data: dataCharts[currentS].values,
+                            borderColor: config.color,
+                            backgroundColor: config.color, // Usiamo lo stesso colore della linea per la riga della legenda
+                            fill: false,
+                            tension: 0.3,
+                            pointRadius: 4,
+                            pointBackgroundColor: config.pointColor,
+                            pointBorderColor: "#fff",
+                            pointBorderWidth: 1,
+                            borderWidth: 2
+                        }]
+                    },
+                    options: { 
+                        responsive: true, 
+                        maintainAspectRatio: false,
+                        plugins: {
+                            legend: {
+                                display: true,
+                                labels: {
+                                    // TRUCCO: Usiamo boxHeight molto piccolo e boxWidth grande per simulare una riga
+                                    boxWidth: 35,
+                                    boxHeight: 2, 
+                                    padding: 20,
+                                    font: { size: 12, weight: 'bold' }
+                                }
+                            }
                         },
-                        margin: {l:0, r:0, b:0, t:0}
-                    };
-                    Plotly.newPlot('plot-area-ACC', [trace], layout);
-                } else {
-                    // Visualizzazione Lineare con Chart.js
-                    const ctx = document.getElementById('chart-' + currentS).getContext('2d');
-                    new Chart(ctx, {
-                        type: 'line',
-                        data: {
-                            labels: dataCharts[currentS].labels,
-                            datasets: [{
-                                label: currentS,
-                                data: dataCharts[currentS].values,
-                                borderColor: '#1a73e8',
-                                backgroundColor: '#1a73e822',
-                                fill: true,
-                                tension: 0.3
-                            }]
-                        },
-                        options: { responsive: true, maintainAspectRatio: false }
-                    });
-                }
+                        scales: {
+                            x: { title: { display: true, text: 'Tempo' } },
+                            y: { beginAtZero: false }
+                        }
+                    }
+                });
 
                 function updateFilters() {
                     const u = document.getElementById('userSelect').value;
@@ -249,7 +264,6 @@ def dashboard():
                     window.location.href = "/dashboard?u=" + u;
                 }
 
-                // Refresh automatico ogni 10 secondi
                 setTimeout(() => { window.location.reload(); }, 10000);
             </script>
         </body>
