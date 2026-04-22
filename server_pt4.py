@@ -101,57 +101,67 @@ def dashboard():
     selected_user = request.args.get('u', lista_utenti[0])
 
     for s in sensori:
-        # MODIFICA: Ordiniamo per timestamp DESC per prendere i 20 più recenti, 
-        # poi invertiamo la lista con [::-1] per mostrarli cronologicamente da sinistra a destra
         cursor.execute("""
             SELECT timestamp, valori 
             FROM dati_sensori 
             WHERE sensor=? AND user=? 
-            ORDER BY timestamp DESC LIMIT 20
+            ORDER BY timestamp DESC LIMIT 50
         """, (s, selected_user))
         
         rows = cursor.fetchall()[::-1]
-        
         labels = [r[0] for r in rows]
-        values = []
-        for r in rows:
-            try:
-                val = json.loads(r[1].replace("'", '"'))
-                if s == "ACC": values.append(float(val.get('x', 0)))
-                else: values.append(float(list(val.values())[0]))
-            except: values.append(0)
-        data_charts[s] = {"labels": labels, "values": values}
+        
+        if s == "ACC":
+            ax, ay, az = [], [], []
+            for r in rows:
+                try:
+                    val = json.loads(r[1].replace("'", '"'))
+                    ax.append(float(val.get('ax', val.get('x', 0))))
+                    ay.append(float(val.get('ay', val.get('y', 0))))
+                    az.append(float(val.get('az', val.get('z', 0))))
+                except:
+                    ax.append(0); ay.append(0); az.append(0)
+            data_charts[s] = {"ax": ax, "ay": ay, "az": az, "labels": labels}
+        else:
+            values = []
+            for r in rows:
+                try:
+                    val = json.loads(r[1].replace("'", '"'))
+                    values.append(float(list(val.values())[0]))
+                except:
+                    values.append(0)
+            data_charts[s] = {"labels": labels, "values": values}
     
     conn.close()
 
     return render_template_string('''
     <html>
         <head>
-            <title>Multi-User Empatica E4 wristband Dashboard</title>
+            <title>Empatica E4 wristband Dashboard</title>
             <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+            <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
             <style>
                 body { font-family: 'Segoe UI', sans-serif; background: #f0f2f5; margin: 0; padding: 20px; }
                 .container { max-width: 900px; margin: auto; }
                 .header { background: white; padding: 15px 25px; border-radius: 12px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; }
                 .controls { background: white; padding: 15px 25px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); display: flex; gap: 20px; }
                 select { padding: 8px; border-radius: 6px; border: 1px solid #1a73e8; color: #1a73e8; font-weight: bold; cursor: pointer; outline: none; }
-                .chart-card { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); height: 450px; display: none; flex-direction: column; }
+                .chart-card { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); height: 500px; display: none; flex-direction: column; }
                 .chart-card.active { display: flex; }
                 h1 { color: #1a73e8; font-size: 1.4em; margin: 0; }
-                .logout { color: #d93025; text-decoration: none; font-weight: bold; border: 1px solid #d93025; padding: 5px 15px; border-radius: 5px; transition: 0.3s; }
-                .logout:hover { background: #fff1f0; }
+                .logout { color: #d93025; text-decoration: none; font-weight: bold; border: 1px solid #d93025; padding: 5px 15px; border-radius: 5px; }
             </style>
         </head>
         <body>
             <div class="container">
                 <div class="header">
-                    <h1>Monitoraggio Empatica E4 wristband</h1>
+                    <h1>Monitoraggio Empatica E4 </h1>
                     <a href="/logout" class="logout">Esci</a>
                 </div>
 
                 <div class="controls">
                     <div>
-                        <label style="color:#5f6368;"> Utente: </label>
+                        <label> Utente: </label>
                         <select id="userSelect" onchange="updateFilters()">
                             {% for u in utenti %}
                             <option value="{{ u }}" {% if u == selected_u %}selected{% endif %}>{{ u }}</option>
@@ -159,9 +169,9 @@ def dashboard():
                         </select>
                     </div>
                     <div>
-                        <label style="color:#5f6368;"> Sensore: </label>
+                        <label> Sensore: </label>
                         <select id="sensorSelect" onchange="updateFilters()">
-                            <option value="ACC">Accelerometro</option>
+                            <option value="ACC">Accelerometro (3D)</option>
                             <option value="BVP">BVP (Pulsazioni)</option>
                             <option value="EDA">EDA (Sudorazione)</option>
                             <option value="HR">Heart Rate (BPM)</option>
@@ -173,83 +183,74 @@ def dashboard():
 
                 {% for s in ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"] %}
                 <div id="card-{{ s }}" class="chart-card">
-                    <h3 style="color:#5f6368; font-size:0.9em; margin-top:0;">CRONOLOGIA LIVE: {{ s }} - UTENTE: <span class="displayUserText"></span></h3>
-                    <div style="flex-grow:1; position:relative;"><canvas id="chart-{{ s }}"></canvas></div>
+                    <h3 style="color:#5f6368; font-size:0.9em; margin-top:0;">{{ s }} - UTENTE: {{ selected_u }}</h3>
+                    <div id="plot-area-{{ s }}" style="flex-grow:1; position:relative;">
+                        {% if s != "ACC" %}<canvas id="chart-{{ s }}"></canvas>{% endif %}
+                    </div>
                 </div>
                 {% endfor %}
             </div>
 
             <script>
                 const dataCharts = {{ data_charts|tojson }};
-                
-                const chartConfigs = {
-                    "ACC": { color: "#1a73e8", label: "Accelerazione X" },
-                    "BVP": { color: "#d93025", label: "Blood Volume Pulse" },
-                    "EDA": { color: "#188038", label: "Attività Elettrodermica" },
-                    "HR":  { color: "#e37400", label: "Battiti Cardiaci (BPM)" },
-                    "IBI": { color: "#7b1fa2", label: "Intervallo tra battiti" },
-                    "TEMP":{ color: "#12b5cb", label: "Temperatura Corporea" }
-                };
+                const currentU = "{{ selected_u }}";
+                const currentS = localStorage.getItem('activeSensor') || 'ACC';
 
-                Object.keys(dataCharts).forEach(s => {
-                    const ctx = document.getElementById('chart-' + s).getContext('2d');
+                // Imposta select al valore corrente
+                document.getElementById('sensorSelect').value = currentS;
+                const activeCard = document.getElementById('card-' + currentS);
+                if(activeCard) activeCard.classList.add('active');
+
+                // --- GESTIONE GRAFICI ---
+                if (currentS === "ACC") {
+                    // Visualizzazione 3D con Plotly
+                    const trace = {
+                        x: dataCharts.ACC.ax,
+                        y: dataCharts.ACC.ay,
+                        z: dataCharts.ACC.az,
+                        mode: 'markers+lines',
+                        marker: { size: 4, color: '#1a73e8', opacity: 0.8 },
+                        line: { color: '#1a73e8', width: 2 },
+                        type: 'scatter3d'
+                    };
+                    const layout = {
+                        scene: {
+                            xaxis: {title: 'AX'},
+                            yaxis: {title: 'AY'},
+                            zaxis: {title: 'AZ'}
+                        },
+                        margin: {l:0, r:0, b:0, t:0}
+                    };
+                    Plotly.newPlot('plot-area-ACC', [trace], layout);
+                } else {
+                    // Visualizzazione Lineare con Chart.js
+                    const ctx = document.getElementById('chart-' + currentS).getContext('2d');
                     new Chart(ctx, {
                         type: 'line',
                         data: {
-                            labels: dataCharts[s].labels,
+                            labels: dataCharts[currentS].labels,
                             datasets: [{
-                                label: chartConfigs[s].label,
-                                data: dataCharts[s].values,
-                                borderColor: chartConfigs[s].color,
-                                backgroundColor: chartConfigs[s].color + '22',
-                                pointBackgroundColor: chartConfigs[s].color,
-                                pointBorderColor: "#fff",
-                                pointRadius: 5,
-                                pointHoverRadius: 7,
+                                label: currentS,
+                                data: dataCharts[currentS].values,
+                                borderColor: '#1a73e8',
+                                backgroundColor: '#1a73e822',
                                 fill: true,
-                                tension: 0.2, // Linea più tesa per evidenziare la sequenza temporale
-                                borderWidth: 3
+                                tension: 0.3
                             }]
                         },
-                        options: { 
-                            responsive: true, 
-                            maintainAspectRatio: false,
-                            plugins: { legend: { display: false } },
-                            scales: {
-                                y: { grid: { color: '#eee' } },
-                                x: { 
-                                    grid: { display: false },
-                                    ticks: { maxRotation: 45, minRotation: 45 } // Timestamp inclinati per leggibilità
-                                }
-                            }
-                        }
+                        options: { responsive: true, maintainAspectRatio: false }
                     });
-                });
+                }
 
                 function updateFilters() {
                     const u = document.getElementById('userSelect').value;
                     const s = document.getElementById('sensorSelect').value;
-                    localStorage.setItem('activeUser', u);
                     localStorage.setItem('activeSensor', s);
                     window.location.href = "/dashboard?u=" + u;
                 }
 
-                const urlParams = new URLSearchParams(window.location.search);
-                const currentU = urlParams.get('u') || localStorage.getItem('activeUser') || (document.getElementById('userSelect').options[0] ? document.getElementById('userSelect').options[0].value : '');
-                const currentS = localStorage.getItem('activeSensor') || 'ACC';
-
-                if(document.getElementById('userSelect').querySelector('option[value="'+currentU+'"]')) {
-                    document.getElementById('userSelect').value = currentU;
-                }
-                document.getElementById('sensorSelect').value = currentS;
-                document.querySelectorAll('.displayUserText').forEach(el => el.innerText = currentU);
-                
-                const activeCard = document.getElementById('card-' + currentS);
-                if(activeCard) activeCard.classList.add('active');
-
-                setTimeout(() => { 
-                    window.location.href = "/dashboard?u=" + currentU;
-                }, 10000);
+                // Refresh automatico ogni 10 secondi
+                setTimeout(() => { window.location.reload(); }, 10000);
             </script>
         </body>
     </html>
