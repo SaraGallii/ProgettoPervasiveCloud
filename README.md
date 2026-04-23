@@ -46,3 +46,12 @@ python server_pt4.py
 http://127.0.0.1:5000/login
 
 Allooora i dati inseriti nei grafici sono ordinati per timestamp
+
+#PUNTO 5
+Per ogni utente, per ognuno dei parametri, il server esegue tre operazioni matematiche sui dati raccolti negli ultimi 7 giorni. Media, Moda e Mediana.Salviamo le statistiche nel db statistiche_settimanali.
+
+python sensor.py
+python server_pt5.py
+
+http://127.0.0.1:5000/statistics
+
