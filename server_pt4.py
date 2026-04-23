@@ -99,15 +99,18 @@ def dashboard():
 
     sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
     data_charts = {}
+    
+    # Recupero parametri dalla URL
     selected_user = request.args.get('u', lista_utenti[0])
+    selected_sess = request.args.get('s', '01') # Default sessione 01
 
     for s in sensori:
         cursor.execute("""
             SELECT timestamp, valori 
             FROM dati_sensori 
-            WHERE sensor=? AND user=? 
+            WHERE sensor=? AND user=? AND session=?
             ORDER BY timestamp DESC LIMIT 50
-        """, (s, selected_user))
+        """, (s, selected_user, selected_sess))
         
         rows = cursor.fetchall()[::-1]
         labels = [r[0] for r in rows]
@@ -181,11 +184,19 @@ def dashboard():
                             <option value="TEMP">Temperatura</option>
                         </select>
                     </div>
+                    <div>
+                        <label> Sessione: </label>
+                        <select id="sessionSelect" onchange="updateFilters()">
+                            <option value="01" {% if selected_s == '01' %}selected{% endif %}>Sessione 01</option>
+                            <option value="02" {% if selected_s == '02' %}selected{% endif %}>Sessione 02</option>
+                            <option value="03" {% if selected_s == '03' %}selected{% endif %}>Sessione 03</option>
+                        </select>
+                    </div>
                 </div>
 
                 {% for s in ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"] %}
                 <div id="card-{{ s }}" class="chart-card">
-                    <h3 id="title-{{ s }}" style="font-size:0.9em; margin-top:0;">{{ s }} - UTENTE: {{ selected_u }}</h3>
+                    <h3 id="title-{{ s }}" style="font-size:0.9em; margin-top:0;">{{ s }} - UTENTE: {{ selected_u }} - SESSIONE: {{ selected_s }}</h3>
                     <div id="plot-area-{{ s }}" style="flex-grow:1; position:relative;">
                         <canvas id="chart-{{ s }}"></canvas>
                     </div>
@@ -225,7 +236,7 @@ def dashboard():
                             label: config.label,
                             data: dataCharts[currentS].values,
                             borderColor: config.color,
-                            backgroundColor: config.color, // Usiamo lo stesso colore della linea per la riga della legenda
+                            backgroundColor: config.color,
                             fill: false,
                             tension: 0.3,
                             pointRadius: 4,
@@ -242,7 +253,6 @@ def dashboard():
                             legend: {
                                 display: true,
                                 labels: {
-                                    // TRUCCO: Usiamo boxHeight molto piccolo e boxWidth grande per simulare una riga
                                     boxWidth: 35,
                                     boxHeight: 2, 
                                     padding: 20,
@@ -259,16 +269,17 @@ def dashboard():
 
                 function updateFilters() {
                     const u = document.getElementById('userSelect').value;
-                    const s = document.getElementById('sensorSelect').value;
-                    localStorage.setItem('activeSensor', s);
-                    window.location.href = "/dashboard?u=" + u;
+                    const sensor = document.getElementById('sensorSelect').value;
+                    const sess = document.getElementById('sessionSelect').value;
+                    localStorage.setItem('activeSensor', sensor);
+                    window.location.href = "/dashboard?u=" + u + "&s=" + sess;
                 }
 
                 setTimeout(() => { window.location.reload(); }, 10000);
             </script>
         </body>
     </html>
-    ''', utenti=lista_utenti, selected_u=selected_user, data_charts=data_charts)
+    ''', utenti=lista_utenti, selected_u=selected_user, selected_s=selected_sess, data_charts=data_charts)
 
 if __name__ == '__main__':
     app.run(port=5000, debug=False)
