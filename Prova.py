@@ -287,9 +287,9 @@ def dashboard():
                     <div class="control-group">
                         <label>Sessione:</label>
                         <select id="sessionSelect" onchange="updateFilters()">
-                            <option value="01" {% if selected_s == '01' %}selected{% endif %}>Sess. 01</option>
-                            <option value="02" {% if selected_s == '02' %}selected{% endif %}>Sess. 02</option>
-                            <option value="03" {% if selected_s == '03' %}selected{% endif %}>Sess. 03</option>
+                            <option value="01" {% if selected_s == '01' %}selected{% endif %}>01</option>
+                            <option value="02" {% if selected_s == '02' %}selected{% endif %}>02</option>
+                            <option value="03" {% if selected_s == '03' %}selected{% endif %}>03</option>
                         </select>
                     </div>
                 </div>
@@ -457,7 +457,7 @@ def statistics_page():
                         <label>Sessione:</label>
                         <select id="sessionSelect" onchange="updateFilters()">
                             {% for s in sessioni %}
-                            <option value="{{ s }}" {% if s == selected_s %}selected{% endif %}>Sess. {{ s }}</option>
+                            <option value="{{ s }}" {% if s == selected_s %}selected{% endif %}>{{ s }}</option>
                             {% endfor %}
                         </select>
                     </div>
