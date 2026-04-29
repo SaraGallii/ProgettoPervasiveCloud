@@ -45,6 +45,9 @@ python sensor.py
 python server_pt4.py
 http://127.0.0.1:5000/login
 
+-----------------------------------------------------------------------------------
+Non devi eliminare il file Empatica_E4_wristband.db dalla cartella del progetto. Se lo elimini, cancelli fisicamente il "cervello" del programma e a quel punto dovresti ricreare gli utenti da capo.
+----------------------------------------------------------------------------------------
 Allooora i dati inseriti nei grafici sono ordinati per timestamp
 
 #PUNTO 5
@@ -54,5 +57,12 @@ python sensor.py
 python server_pt5.py
 
 http://127.0.0.1:5000/statistics
+
+FILE PROVA
+run : 
+python sensor.py
+python Prova.py
+http://127.0.0.1:5000/login
+
 
 
