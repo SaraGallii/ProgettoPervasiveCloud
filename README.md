@@ -64,5 +64,23 @@ python sensor.py
 python Prova.py
 http://127.0.0.1:5000/login
 
+-----------------------------------------------------------------------------------
+LIBRERIE NECESSARIE --> da installare tramite requrements.txt nella Macchina Virtuale
+
+requests
+flask
+pymongo
+
+-----------------------------------------------------------------------------------
+
+VERSIONE FRA(TM) --> TM sta per Trade Mark (marchio registrato)
+
+python client_FRA.py --> è un mix tra sensor.py e senso_pt3.py
+python server_FRA.py --> salvataggio dati su NoSQL (mediante MongoDB)
+http://127.0.0.1:5000
+
+net start MongoDB
+net stop MongoDB 
+
 
 
