@@ -65,32 +65,9 @@ python Prova.py
 http://127.0.0.1:5000/login
 
 -----------------------------------------------------------------------------------
-LIBRERIE NECESSARIE --> da installare tramite requrements.txt nella Macchina Virtuale
 
-requests
-flask
-pymongo
-
------------------------------------------------------------------------------------
-
-VERSIONE FRA(TM) --> TM sta per Trade Mark (marchio registrato)
-
-DESCRIZIONE PROGRAMMI:
-python client_FRA.py --> è un mix tra sensor.py e senso_pt3.py
-python server_FRA.py --> salvataggio dati su NoSQL (mediante MongoDB)
-http://127.0.0.1:5000
-
-COSA FARE PER ESEGUIRE:
-
-Innanzitutto bisogna far partire MongoDB
-net start MongoDB
-net stop MongoDB 
-
-
-py server_FRA.py
-py client_FRA.py
-py client_FRA.py fatigueset
-
-Controllo rapido
-Server health: http://127.0.0.1:5000/health
-Test route: http://127.0.0.1:5000/test_nosql
+Per collegare il programma su GCP sta nel caricarlo prima su Github, poi in SSH faccio: 
+sudo apt-get install git
+git clone https://github.com/SaraGallii/ProgettoPervasiveCloud
+pip install -r requirements.txt
+git pull 
