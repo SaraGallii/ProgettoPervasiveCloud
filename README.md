@@ -85,6 +85,7 @@ cd server
 gcloud app deploy
 gcloud app browse
 
+-----------------------------------------------------------------------------------
 
 PIPELINE PROGRAMMI:
 
