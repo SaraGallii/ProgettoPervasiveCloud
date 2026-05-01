@@ -1,53 +1,67 @@
-from flask import Flask, request, jsonify
+import sys
+import logging
 from datetime import datetime
-from pymongo import MongoClient
-import json
+from flask import Flask, request, jsonify
+from pymongo import MongoClient, errors
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
 app = Flask(__name__)
 
 # --- CONFIGURAZIONE NOSQL (MongoDB) ---
 # Si assume un'istanza MongoDB attiva localmente
-client = MongoClient('mongodb://localhost:27017/')
+try:
+    client = MongoClient('mongodb://localhost:27017/', serverSelectionTimeoutMS=5000)
+    client.server_info()
+except errors.ServerSelectionTimeoutError as e:
+    logging.error(f"Impossibile connettersi a MongoDB: {e}")
+    sys.exit(1)
+
 db = client['EmpaticaE4_NoSQL']
 # Collezione unica per i dati dei sensori
 collection = db['sensor_data']
 
 @app.route('/data', methods=['POST'])
 def receive_data():
-    data = request.json
+    if not request.is_json:
+        return jsonify({"status": "error", "message": "Richiesta JSON non valida"}), 400
+
+    data = request.get_json(silent=True)
     if not data:
         return jsonify({"status": "error", "message": "No data received"}), 400
 
-    try:
-        # Estrazione metadati dal payload inviato dal client
-        user_id = data.get('user')      # Es: "01", "02"
-        session_id = data.get('session') # Es: "01", "02", "03" (i tuoi "passi")
-        sensor_type = data.get('sensor') # Es: "ACC", "BVP", "EDA", "HR", "IBI", "TEMP"
-        timestamp_raw = data.get('timestamp')
-        sensor_values = data.get('data') # I dati estratti dal CSV[cite: 3]
+    user_id = data.get('user')
+    session_id = data.get('session')
+    sensor_type = data.get('sensor')
+    timestamp_raw = data.get('timestamp')
+    sensor_values = data.get('data')
 
-        # Creazione del documento NoSQL
-        document = {
-            "user": user_id,
-            "step": session_id,
-            "sensor": sensor_type,
-            "timestamp_device": timestamp_raw,
-            "received_at": datetime.now().isoformat(),
-            "measurements": sensor_values
-        }
-
-        # Salvataggio nel repository locale NoSQL
-        result = collection.insert_one(document)
-
-        print(f"[NoSQL] Salvato documento per Utente {user_id}, Passo {session_id}, Sensore {sensor_type}")
-        
+    missing = [key for key in ('user', 'session', 'sensor', 'timestamp', 'data') if data.get(key) is None]
+    if missing:
         return jsonify({
-            "status": "success", 
-            "id_documento": str(result.inserted_id)
-        }), 200
+            "status": "error",
+            "message": f"Campi mancanti: {', '.join(missing)}"
+        }), 400
 
+    if not isinstance(sensor_values, dict):
+        return jsonify({"status": "error", "message": "Formato misure non valido"}), 400
+
+    document = {
+        "user": user_id,
+        "step": session_id,
+        "sensor": sensor_type,
+        "timestamp_device": timestamp_raw,
+        "received_at": datetime.utcnow().isoformat() + 'Z',
+        "measurements": sensor_values
+    }
+
+    try:
+        result = collection.insert_one(document)
+        logging.info(
+            f"[NoSQL] Salvato documento per Utente {user_id}, Passo {session_id}, Sensore {sensor_type}"
+        )
+        return jsonify({"status": "success", "id_documento": str(result.inserted_id)}), 200
     except Exception as e:
-        print(f"Errore durante il salvataggio NoSQL: {e}")
+        logging.exception(f"Errore durante il salvataggio NoSQL: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 # Rotta di test per visualizzare gli ultimi inserimenti
@@ -58,7 +72,10 @@ def get_recent_data():
         doc['_id'] = str(doc['_id'])
     return jsonify(recent_docs)
 
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({"status": "ok"}), 200
+
 if __name__ == '__main__':
-    print("--- Server NoSQL Ricezione Dati Avviato ---")
-    # Il server gira sulla porta 5000 come richiesto dai client[cite: 3, 4]
-    app.run(port=5000, debug=False)
+    logging.info("--- Server NoSQL Ricezione Dati Avviato ---")
+    app.run(host='0.0.0.0', port=5000, debug=False)

@@ -4,12 +4,15 @@ import time
 import threading
 import os
 import sys
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
 
 # Client per inviare i dati dei sensori al server Flask
 class FatigueSetClient:
     def __init__(self, server_url):
         self.server_url = server_url
-        self.started_sessions = set()
+        self.started_files = set()
 
     # Legge il CSV riga per riga e invia i dati via HTTP POST
     def send_data(self, file_path, sensor_name, interval):
@@ -17,31 +20,48 @@ class FatigueSetClient:
         parts = file_path.split(os.sep)
         user_id = parts[-3] if len(parts) >= 3 else "unknown_user"
         session_id = parts[-2] if len(parts) >= 2 else "unknown_session"
-        
-        # Log di avvio del sensore
+
+        logging.info(f"Avvio invio dati: user={user_id}, session={session_id}, sensor={sensor_name}")
+
         try:
-            with open(file_path, mode='r') as f:
+            with open(file_path, mode='r', newline='') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    ts = row.pop('timestamp', time.time()) 
+                    timestamp = row.pop('timestamp', None)
+                    if timestamp is None or timestamp == '':
+                        timestamp = time.time()
 
                     payload = {
                         "user": user_id,
                         "session": session_id,
                         "sensor": sensor_name,
-                        "timestamp": ts,
-                        "data": row 
+                        "timestamp": timestamp,
+                        "data": row
                     }
 
-                    # Invio al server Flask
-                    try:
-                        requests.post(self.server_url, json=payload, timeout=2)
-                    except Exception:
-                        pass
-                    
+                    for attempt in range(1, 4):
+                        try:
+                            response = requests.post(self.server_url, json=payload, timeout=5)
+                            if response.status_code != 200:
+                                logging.warning(
+                                    f"Server response {response.status_code} for {file_path}: {response.text}"
+                                )
+                            break
+                        except requests.exceptions.RequestException as err:
+                            logging.error(
+                                f"Errore connessione al server (tentativo {attempt}/3) per {file_path}: {err}"
+                            )
+                            if attempt == 3:
+                                return
+                            time.sleep(2)
+
                     time.sleep(interval)
+        except FileNotFoundError:
+            logging.error(f"File non trovato: {file_path}")
+        except csv.Error as e:
+            logging.exception(f"Errore CSV nel file {file_path}: {e}")
         except Exception as e:
-            print(f"Errore durante l'invio: {e}")
+            logging.exception(f"Errore durante l'invio del file {file_path}: {e}")
     
     # Scansiona la cartella cercando file CSV e lancia thread per ogni sensore
     def monitora_directory(self, base_dir):
@@ -55,22 +75,21 @@ class FatigueSetClient:
             "wrist_skin_temperature.csv": {"name": "TEMP", "int": 0.25}
         }
 
-        # Loop infinito per monitorare la directory: ogni 5 secondi scansiona di nuovo per nuovi file
         while True:
             for root, dirs, files in os.walk(base_dir):
-                if any(f in sensor_configs for f in files):
-                    if root not in self.started_sessions:
-                        self.started_sessions.add(root)
-                        for file_name in files:
-                            if file_name in sensor_configs:
-                                conf = sensor_configs[file_name]
-                                full_path = os.path.join(root, file_name)
-                                t = threading.Thread(
-                                    target=self.send_data, 
-                                    args=(full_path, conf["name"], conf["int"]),
-                                    daemon=True 
-                                )
-                                t.start()
+                for file_name in files:
+                    if file_name in sensor_configs:
+                        full_path = os.path.join(root, file_name)
+                        if full_path in self.started_files:
+                            continue
+                        self.started_files.add(full_path)
+                        conf = sensor_configs[file_name]
+                        t = threading.Thread(
+                            target=self.send_data,
+                            args=(full_path, conf["name"], conf["int"]),
+                            daemon=True
+                        )
+                        t.start()
             time.sleep(5)
 
 # Punto di ingresso del programma
