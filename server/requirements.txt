@@ -1,0 +1,6 @@
+requests
+flask
+google-cloud-firestore
+google-cloud-storage
+python-telegram-bot
+gunicorn

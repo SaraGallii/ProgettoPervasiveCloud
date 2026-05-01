@@ -66,8 +66,31 @@ http://127.0.0.1:5000/login
 
 -----------------------------------------------------------------------------------
 
-Per collegare il programma su GCP sta nel caricarlo prima su Github, poi in SSH faccio: 
-sudo apt-get install git
+COMANDI PER ESEGUIRE IL PROGRAMMA SU APP ENGINE (GOOGLE CLOUD PLATFORM):
+
+gcloud init
+gcloud config set project progetto-pccloud-1
+gcloud services enable appengine.googleapis.com firestore.googleapis.com cloudbuild.googleapis.com
+
+# (consigliato) controlla se App Engine esiste già
+gcloud app describe
+
+# esegui SOLO se app describe fallisce
+gcloud app create --region=europe-west
+
 git clone https://github.com/SaraGallii/ProgettoPervasiveCloud
-pip install -r requirements.txt
-git pull 
+cd ProgettoPervasiveCloud
+cd server
+
+gcloud app deploy
+gcloud app browse
+
+
+PIPELINE PROGRAMMI:
+
+server/
+    main.py
+    requirements.txt
+    app.yaml
+client_iot.py
+
