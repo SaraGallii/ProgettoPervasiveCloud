@@ -64,28 +64,7 @@ python sensor.py
 python Prova.py
 http://127.0.0.1:5000/login
 
------------------------------------------------------------------------------------
-
-COMANDI PER ESEGUIRE IL PROGRAMMA SU APP ENGINE (GOOGLE CLOUD PLATFORM):
-
-gcloud init
-gcloud config set project progetto-pccloud-1
-gcloud services enable appengine.googleapis.com firestore.googleapis.com cloudbuild.googleapis.com
-
-# (consigliato) controlla se App Engine esiste già
-gcloud app describe
-
-# esegui SOLO se app describe fallisce
-gcloud app create --region=europe-west
-
-git clone https://github.com/SaraGallii/ProgettoPervasiveCloud
-cd ProgettoPervasiveCloud
-cd server
-
-gcloud app deploy
-gcloud app browse
-
------------------------------------------------------------------------------------
+---------------------------------------------------------------------
 
 PIPELINE PROGRAMMI:
 
@@ -95,3 +74,127 @@ server/
     app.yaml
 client_iot.py
 
+-----------------------------------------------------
+
+gcloud projects list
+gcloud config set project [PROJECT_ID] → ad esempio pcloud2025
+Carico i 3 file: app.yaml, main.py, requirements.txt. 
+Creo una cartella e vi inserisco dentro i file: 
+mkdir es_sensor1 → creo la cartella
+mv requirements.txt es_sensor1 → sposto il file nella cartella (lo faccio anche per main e yaml)
+gcloud app deploy → numeric choice: 11. Una volta completato mi restituisce:
+Deployed service [default] to [URL in cui posso trovare il sito]
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# (Opzionale) Pulisci eventuali cartelle già presenti
+cd ~
+rm -rf ProgettoPervasiveCloud
+
+# Verifica se hai già una chiave SSH
+ls -la ~/.ssh
+
+# Se non ce l'hai generala
+ssh-keygen -t ed25519 -C "la_tua_email_github@example.com"
+# Avvia ssh-agent e aggiungi la chiave
+eval "$(ssh-agent -s)"
+ssh-add ~/.ssh/id_ed25519
+# Stampa la chiave pubblica e copiala
+cat ~/.ssh/id_ed25519.pub
+# Vai su GitHub → Settings → SSH and GPG keys → New SSH key → incolla la chiave → salva.
+
+# Test connessione SSH con GitHub
+ssh -T git@github.com
+# Se ti chiede conferma host, scrivi yes
+# Se tutto è ok, GitHub ti conferma l’autenticazione (è normale che dica che non fornisce “shell access”).
+
+# Clona il repository usando l’URL SSH
+cd ~
+git clone git@github.com:SaraGallii/ProgettoPervasiveCloud.git
+cd ProgettoPervasiveCloud
+
+# Se la repo era già clonata in HTTPS: converti il remote a SSH
+# Se sei già dentro ProgettoPervasiveCloud ma git pull ti chiede username/password, significa che il remote è in HTTPS. Cambialo così:
+cd ~/ProgettoPervasiveCloud
+git remote -v
+git remote set-url origin git@github.com:SaraGallii/ProgettoPervasiveCloud.git
+git remote -v
+git pull
+
+# Configura identità Git (nome/email) per poter fare commit e push
+git config --global user.name "Romano Francesco"
+git config --global user.email "francescor154@gmail.com"
+
+# Flusso tipico di lavoro (commit + push)
+git status
+git add .
+git commit -m "update"
+git push origin main
+
+
+---------------------------------------------
+
+gcloud config set project progetto-pccloud-1
+gcloud services enable appengine.googleapis.com firestore.googleapis.com cloudbuild.googleapis.com
+
+gcloud app describe
+
+gcloud app create --region=europe-west
+
+
+
+COMANDI PER ESEGUIRE IL PROGRAMMA SU APP ENGINE/cloud shell (GOOGLE CLOUD console):
+
+gcloud init
+gcloud config set project progetto-pccloud-1
+
+gcloud services enable appengine.googleapis.com firestore.googleapis.com cloudbuild.googleapis.com
+
+# (consigliato) controlla se App Engine esiste già
+gcloud app describe
+
+gcloud app create
+
+# esegui SOLO se app describe fallisce
+gcloud app create --region=europe-west
+
+git clone https://github.com/SaraGallii/ProgettoPervasiveCloud
+cd ProgettoPervasiveCloud
+cd server
+
+# se non fa inserire la password si crea una chiave pubblica mediante SSH:
+ssh-keygen -t ed25519 -C <MAIL_ACCOUNT-GITHUB>
+cat ~/.ssh/id_ed25519.pub
+Vai su GitHub → Settings → SSH and GPG keys → New SSH key e incolla l’output della .pub.
+git clone git@github.com:SaraGallii/ProgettoPervasiveCloud.git
+
+gcloud app deploy
+gcloud app browse
+
+
+# per aggiornare
+git pull ProgettoPervasiveCloud
+
+# Questo cancella le cartelle delle repo Git dentro ~ (irreversibile).
+cd ~
+find . -maxdepth 4 -type d -name ".git" -print | sed 's/\/\.git$//' | while read -r repo; do
+  repo_clean="${repo#./}"
+  if [ -n "$repo_clean" ] && [ -d "$repo_clean" ]; then
+    echo "Cancello: $repo_clean"
+    rm -rf "$repo_clean"
+  fi
+done
