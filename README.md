@@ -66,4 +66,7 @@ http://127.0.0.1:5000/login
 
 ---------------------------------------------------------------------
 
+PER MACCHINA VIRTUALE:
 
+python -m venv venv
+.\venv\Scripts\activate
