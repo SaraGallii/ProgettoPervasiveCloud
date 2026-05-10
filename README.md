@@ -1,81 +1,47 @@
-# ProgettoPervasiveCloud
+# Progetto base (locale) — Empatica E4 / FatigueSet
 
-#INFO UTILI PER ESAME. PUNTO 1
-Aprire due terminali in contemporanea e digitare:
-python sensor.py (client)
-python server.py (server)
+Questa versione include solo i requisiti **già soddisfatti**:
+- Client che legge i CSV e invia righe via HTTP POST a intervalli regolari.
+- Inserimento dinamico di nuove sorgenti dati (nuove cartelle) mentre il client gira.
+- Server che riceve e salva su SQLite.
+- Login.
+- Dashboard con grafico (1 sensore alla volta).
+- Statistiche ultimi 7 giorni (calcolo + salvataggio in DB dedicato).
 
-http://127.0.0.1:5000/data
+## Struttura cartelle attesa
+Metti il dataset sotto `fatigueset/` (hardcoded in `client.py`) con struttura:
 
-#FUNZIONAMENTO HTTP. PUNTO 1
-La comunicazione avviene tramite HTTP (HyperText Transfer Protocol).Nel Client (sensor.py) il protocollo è rappresentato dalla libreria requests. Quando si scrive requests.post(...), s sta inviando un "pacchetto" HTTP di tipo POST (usato per inviare dati) verso il server.
-Nel Server (server.py) il protocollo è gestito da Flask. Flask rimane "in ascolto" sulla porta 5000 aspettando messaggi che seguano le regole dell'HTTP.
+```
+fatigueset/
+  P01/
+    01/
+      wrist_hr.csv
+      wrist_acc.csv
+      ...
+```
 
-#SPIEGAZIONE DI SENSOR_CONFIGS. PUNTO 1
-I sensori reali dell'Empatica E4 campionano i dati a frequenze diverse (Hertz). Per simulare un comportamento reale, il codice deve "aspettare" un tot di tempo prima di leggere la riga successiva del CSV. Grazie a sensor_configs (in sensor.py) viene simulato un sensore vero; il server riceve i dati con la stessa cadenza con cui verrebbero generati dal braccialetto. Inoltre si evita il crash perchè se inviassi milioni di righe istantaneamente, il server Flask probabilmente smetterebbe di rispondere. Viene poi mantenuto l'ordine, si sa esattamente quale file corrisponde a quale sensore.
+Il client invierà `user=01` (converte `P01 -> 01`) e `session=01`.
 
-File,Nome,Intervallo(int),Spiegazione(Hz)
-wrist_acc.csv,ACC,0.031s,L'accelerometro produce circa 32 dati al secondo (1/32≈0.031).
-wrist_bvp.csv,BVP,0.015s,"Il segnale del volume del sangue è molto veloce, circa 64Hz (1/64≈0.015).
-wrist_eda.csv,EDA,0.25s,"L'attività elettrodermica è lenta, 4 dati al secondo (1/4=0.25).
-wrist_hr.csv,HR,1.0s,La frequenza cardiaca viene aggiornata una volta al secondo (1Hz).
-wrist_temp.csv,TEMP,0.25s,La temperatura viene letta 4 volte al secondo (4Hz).
+## Avvio
 
-#PUNTO 2
-Installare SQLite Viewer (da Exstension su VisualStudioCode) per visualizzare il database nel quale vengono salvati i dati in tempo reale.
-
-#PUNTO 3. 
-
-Apriamo più terminali:
-
-CON PERCORSO ASSOLUTO
-python server.py
-python sensor_pt3.py C:\Users\galli\OneDrive\Desktop\fatigueset\fatigueset\01
-python sensor_pt3.py C:\Users\galli\OneDrive\Desktop\fatigueset\fatigueset\05 
-
-CON PERCORSO RELATIVO
-python server.py
-python sensor_pt3.py fatigueset\01
-python sensor_pt3.py fatigueset\02
-
-"Inserire dinamicamente un client" significa che se io apro due terminali diversi e lancio lo script due volte su due cartelle diverse, il server deve essere in grado di gestirli contemporaneamente senza confondersi.
-
-#PUNTO 4
-python sensor.py
-python server_pt4.py
-http://127.0.0.1:5000/login
-
------------------------------------------------------------------------------------
-Non devi eliminare il file Empatica_E4_wristband.db dalla cartella del progetto. Se lo elimini, cancelli fisicamente il "cervello" del programma e a quel punto dovresti ricreare gli utenti da capo.
-----------------------------------------------------------------------------------------
-Allooora i dati inseriti nei grafici sono ordinati per timestamp
-
-#PUNTO 5
-Per ogni utente, per ognuno dei parametri, il server esegue tre operazioni matematiche sui dati raccolti negli ultimi 7 giorni. Media, Moda e Mediana.Salviamo le statistiche nel db statistiche_settimanali.
-
-python sensor.py
-python server_pt5.py
-
-http://127.0.0.1:5000/statistics
-
-FILE PROVA
-run : 
-python sensor.py
-python Prova.py
-http://127.0.0.1:5000/login
-
----------------------------------------------------------------------
-
-PER MACCHINA VIRTUALE (locale):
-
-python -m venv venv
-.\venv\Scripts\activate
+```bash
 pip install -r requirements.txt
+python server.py
+python client.py
+```
 
-SE DA' PROBLEMI IL COMANDO ".\venv\Scripts\activate" ESEGUIRE PRIMA QUESTO:
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+Apri nel browser:
+- http://127.0.0.1:5000/
 
+Credenziali demo:
+- admin / 0123
+- user1 / 1111
+- user2 / 2222
 
-PER MACCHINA VIRTUALE (Google Cloud):
+## Database
+- `Empatica_E4_wristband.db` (dati raw)
+- `statistiche_settimanali.db` (metriche settimanali)
 
-sudo apt update && sudo apt upgrade
+## Grafici
+Per semplicità è incluso un file `static/chart.umd.min.js` che implementa una **API minima** compatibile con `new Chart(...)`.
+Se vuoi Chart.js ufficiale, sostituisci quel file con la build UMD ufficiale.
