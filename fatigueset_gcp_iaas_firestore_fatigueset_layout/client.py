@@ -76,8 +76,7 @@ class FatigueSetClient:
             for root, dirs, files in os.walk(base_dir):
                 if any(f in SENSOR_CONFIGS for f in files):
                     if root not in self.started_sessions:
-                        print(f"
-[NEW] Rilevata nuova sorgente dati: {root}")
+                        print(f"[NEW] Rilevata nuova sorgente dati: {root}")
                         self.started_sessions.add(root)
                         for file_name in files:
                             if file_name in SENSOR_CONFIGS:
@@ -97,5 +96,4 @@ if __name__ == "__main__":
     try:
         client.monitora_directory(DATASET_PATH)
     except KeyboardInterrupt:
-        print("
-[STOP] Monitoraggio interrotto dall'utente.")
+        print("[STOP] Monitoraggio interrotto dall'utente.")
