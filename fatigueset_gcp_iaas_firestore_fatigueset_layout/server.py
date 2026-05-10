@@ -349,5 +349,4 @@ def statistics_page():
 
 if __name__ == '__main__':
     # debug diretto su VM (non produzione)
-    # porta 80
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', '80')), debug=False)
