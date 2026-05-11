@@ -64,5 +64,18 @@ python sensor.py (CLIENT)
 python Prova.py (SERVER)
 http://127.0.0.1:5000/login
 
+---------------------------------------------------------------------
+
+PER MACCHINA VIRTUALE (locale):
+
+python -m venv venv
+.\venv\Scripts\activate
+pip install -r requirements.txt
+
+SE DA' PROBLEMI IL COMANDO ".\venv\Scripts\activate" ESEGUIRE PRIMA QUESTO:
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 
 
+PER MACCHINA VIRTUALE (Google Cloud):
+
+sudo apt update && sudo apt upgrade

@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Login - Empatica E4</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}" />
+</head>
+<body>
+  <div class="container narrow">
+    <header class="topbar">
+      <div>
+        <h1 class="h1">Login</h1>
+        <p class="muted">Utenti demo: admin/0123, user1/1111, user2/2222</p>
+      </div>
+      <div class="right">
+        <a class="btn btn-outline" href="{{ url_for('index') }}">Home</a>
+      </div>
+    </header>
+
+    <main class="card">
+      {% if error %}
+        <div class="alert">{{ error }}</div>
+      {% endif %}
+
+      <form method="post" class="form">
+        <label>Username</label>
+        <input name="username" type="text" placeholder="admin" required />
+
+        <label>Password</label>
+        <input name="password" type="password" placeholder="0123" required />
+
+        <button class="btn" type="submit">Accedi</button>
+      </form>
+    </main>
+  </div>
+</body>
+</html>
