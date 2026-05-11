@@ -60,8 +60,8 @@ http://127.0.0.1:5000/statistics
 
 FILE PROVA
 run : 
-python sensor.py
-python Prova.py
+python sensor.py (CLIENT)
+python Prova.py (SERVER)
 http://127.0.0.1:5000/login
 
 
