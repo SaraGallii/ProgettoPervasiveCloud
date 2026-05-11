@@ -1,4 +1,4 @@
 flask
 requests
 google-cloud-storage
-google-firestore
+google-cloud-firestore
