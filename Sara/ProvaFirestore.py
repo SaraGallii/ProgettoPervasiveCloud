@@ -120,8 +120,8 @@ def dashboard():
         return redirect(url_for('login'))
 
     # Recupero utenti unici
-    docs = db.collection('dati_sensori').stream()
-    lista_utenti = sorted(list(set(doc.to_dict().get('user') for doc in docs if doc.to_dict().get('user'))))
+    docs_u = db.collection('utenti').stream()
+    lista_utenti = [d.id for d in docs_u if d.id != 'admin']
     if not lista_utenti: lista_utenti = ["Nessun dato"]
 
     sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
