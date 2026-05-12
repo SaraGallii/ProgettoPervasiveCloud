@@ -10,7 +10,7 @@ app.secret_key = "p4ssw0rd"
 
 # --- INIZIALIZZAZIONE FIRESTORE ---
 # Se sei su una VM Google Cloud con permessi corretti, basta firestore.Client()
-# Altrimenti usa: firestore.Client.from_service_account_json('path/to/key.json')
+# Altrimenti usa: firestore.Client.from_service_account_json('path/to/key.json').
 db = firestore.Client()
 
 def init_db():
