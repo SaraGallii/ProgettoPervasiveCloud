@@ -119,9 +119,9 @@ def dashboard():
     if 'user' not in session:
         return redirect(url_for('login'))
 
-    # Recupero utenti unici
-    docs_u = db.collection('utenti').stream()
-    lista_utenti = [d.id for d in docs_u if d.id != 'admin']
+    docs_utenti = db.collection('utenti').stream()
+    # Prendiamo solo gli ID che sono numeri (es. 01, 02) escludendo 'admin'
+    lista_utenti = sorted([u.id for u in docs_utenti if u.id != 'admin'])
     if not lista_utenti: lista_utenti = ["Nessun dato"]
 
     sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
