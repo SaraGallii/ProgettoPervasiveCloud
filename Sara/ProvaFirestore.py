@@ -95,166 +95,189 @@ def logout():
     return redirect(url_for('login'))
 
 # --- ROTTA DASHBOARD ---
+# --- ROTTA DASHBOARD ---
 @app.route('/dashboard_admin')
 def dashboard():
     if 'user' not in session:
         return redirect(url_for('login'))
 
-    # Recupero lista utenti unica dai dati
-    docs_u = db.collection('dati_sensori').select(['user']).stream()
-    lista_utenti = sorted(list(set([d.to_dict()['user'] for d in docs_u])))
-    if not lista_utenti: lista_utenti = ["Nessun dato"]
+    try:
+        # 1. Recupero lista utenti unica dai dati reali presenti su Firestore
+        docs_u = db.collection('dati_sensori').select(['user']).stream()
+        lista_utenti = sorted(list(set([d.to_dict().get('user') for d in docs_u if d.to_dict().get('user')])))
+        
+        # Gestione database vuoto
+        if not lista_utenti: 
+            lista_utenti = ["Nessun dato"]
 
-    sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
-    data_charts = {}
-    
-    selected_user = request.args.get('u', lista_utenti[0])
-    selected_sess = request.args.get('s', '01') 
+        # Parametri di selezione (da URL o default)
+        selected_user = request.args.get('u', lista_utenti[0])
+        selected_sess = request.args.get('s', '01') 
+        
+        sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
+        data_charts = {}
 
-    for s in sensori:
-        query = db.collection('dati_sensori')\
-                  .where('sensor', '==', s)\
-                  .where('user', '==', selected_user)\
-                  .where('session', '==', selected_sess)\
-                  .order_by('data_ricezione', direction=firestore.Query.DESCENDING)\
-                  .limit(50)
-        
-        rows = [d.to_dict() for d in query.stream()]
-        rows.reverse() # Ordine temporale corretto
-        
-        labels = [r['timestamp'] for r in rows]
-        
-        if s == "ACC":
-            magnitudes = []
-            for r in rows:
-                try:
-                    val = json.loads(r['valori'].replace("'", '"'))
-                    ax = float(val.get('ax', val.get('x', 0)))
-                    ay = float(val.get('ay', val.get('y', 0)))
-                    az = float(val.get('az', val.get('z', 0)))
-                    mag = math.sqrt(ax**2 + ay**2 + az**2)
-                    magnitudes.append(round(mag, 3))
-                except: magnitudes.append(0)
-            data_charts[s] = {"labels": labels, "values": magnitudes}
-        else:
+        for s in sensori:
+            # Query filtrata e ordinata (richiede l'indice che hai creato)
+            query = db.collection('dati_sensori')\
+                      .where('user', '==', selected_user)\
+                      .where('sensor', '==', s)\
+                      .where('session', '==', selected_sess)\
+                      .order_by('data_ricezione', direction=firestore.Query.DESCENDING)\
+                      .limit(50)
+            
+            results = [d.to_dict() for d in query.stream()]
+            results.reverse() # Invertiamo per avere l'ordine temporale corretto sul grafico
+            
+            labels = [r.get('timestamp', '--:--') for r in results]
             values = []
-            for r in rows:
+            
+            for r in results:
                 try:
-                    val = json.loads(r['valori'].replace("'", '"'))
-                    values.append(float(list(val.values())[0]))
-                except: values.append(0)
-            data_charts[s] = {"labels": labels, "values": values} 
+                    # Gestione flessibile: Firestore può restituire stringhe o mappe
+                    val_raw = r.get('valori', '{}')
+                    if isinstance(val_raw, str):
+                        val = json.loads(val_raw.replace("'", '"'))
+                    else:
+                        val = val_raw
+                    
+                    if s == "ACC":
+                        # Calcolo Magnitudo Accelerazione
+                        ax = float(val.get('ax', val.get('x', 0)))
+                        ay = float(val.get('ay', val.get('y', 0)))
+                        az = float(val.get('az', val.get('z', 0)))
+                        mag = math.sqrt(ax**2 + ay**2 + az**2)
+                        values.append(round(mag, 3))
+                    else:
+                        # Per gli altri sensori, prendiamo il primo valore numerico disponibile
+                        # (es. {"hr": "74.63"} diventa 74.63)
+                        valore_numerico = float(next(iter(val.values())))
+                        values.append(valore_numerico)
+                except:
+                    values.append(0)
+            
+            data_charts[s] = {"labels": labels, "values": values}
 
-    return render_template_string('''
-    <html>
-        <head>
-            <title>Dashboard Empatica E4</title>
-            <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-            <style>
-                body { font-family: 'Segoe UI', sans-serif; background: #f0f2f5; margin: 0; padding: 0; }
-                .navbar { background: #1a73e8; color: white; padding: 0 25px; height: 60px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 10px rgba(0,0,0,0.1); position: sticky; top: 0; z-index: 1000; }
-                .nav-title { margin: 0; font-size: 1.3rem; }
-                .dropdown { position: relative; display: inline-block; }
-                .dropbtn { background-color: rgba(255,255,255,0.15); color: white; padding: 8px 16px; font-size: 14px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
-                .dropdown-content { display: none; position: absolute; right: 0; background-color: white; min-width: 200px; box-shadow: 0px 8px 16px rgba(0,0,0,0.2); z-index: 1; border-radius: 4px; overflow: hidden; }
-                .dropdown-content a { color: #333; padding: 12px 16px; text-decoration: none; display: block; font-size: 14px; }
-                .dropdown-content a:hover { background-color: #f1f1f1; }
-                .dropdown:hover .dropdown-content { display: block; }
-                .container { max-width: 1000px; margin: 20px auto; padding: 0 20px; }
-                .controls { background: white; padding: 15px 25px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); display: flex; gap: 20px; flex-wrap: wrap; }
-                .control-group { display: flex; align-items: center; gap: 8px; }
-                select { padding: 6px; border-radius: 6px; border: 1px solid #ddd; }
-                .chart-card { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); height: 450px; display: none; }
-                .chart-card.active { display: flex; flex-direction: column; }
-                .logout-link { color: #d93025 !important; font-weight: bold; border-top: 1px solid #eee; }
-            </style>
-        </head>
-        <body>
-            <nav class="navbar">
-                <h1 class="nav-title">Empatica E4 Dashboard</h1>
-                <div class="dropdown">
-                    <button class="dropbtn">Menu principale ▼</button>
-                    <div class="dropdown-content">
-                        <a href="/dashboard_admin">Grafici</a>
-                        <a href="/statistics_admin">Statistiche</a>
-                        <a href="/register">Registrazione Nuovo Utente</a>
-                        <a href="/logout" class="logout-link">Esci (Logout)</a>
+        return render_template_string('''
+        <html>
+            <head>
+                <title>Dashboard Empatica E4</title>
+                <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+                <style>
+                    body { font-family: 'Segoe UI', sans-serif; background: #f0f2f5; margin: 0; padding: 0; }
+                    .navbar { background: #1a73e8; color: white; padding: 0 25px; height: 60px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 10px rgba(0,0,0,0.1); position: sticky; top: 0; z-index: 1000; }
+                    .nav-title { margin: 0; font-size: 1.3rem; }
+                    .dropdown { position: relative; display: inline-block; }
+                    .dropbtn { background-color: rgba(255,255,255,0.15); color: white; padding: 8px 16px; font-size: 14px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+                    .dropdown-content { display: none; position: absolute; right: 0; background-color: white; min-width: 200px; box-shadow: 0px 8px 16px rgba(0,0,0,0.2); z-index: 1; border-radius: 4px; overflow: hidden; }
+                    .dropdown-content a { color: #333; padding: 12px 16px; text-decoration: none; display: block; font-size: 14px; }
+                    .dropdown-content a:hover { background-color: #f1f1f1; }
+                    .dropdown:hover .dropdown-content { display: block; }
+                    .container { max-width: 1000px; margin: 20px auto; padding: 0 20px; }
+                    .controls { background: white; padding: 15px 25px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); display: flex; gap: 20px; flex-wrap: wrap; }
+                    .control-group { display: flex; align-items: center; gap: 8px; }
+                    select { padding: 6px; border-radius: 6px; border: 1px solid #ddd; }
+                    .chart-card { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); height: 450px; display: none; }
+                    .chart-card.active { display: flex; flex-direction: column; }
+                    .logout-link { color: #d93025 !important; font-weight: bold; border-top: 1px solid #eee; }
+                </style>
+            </head>
+            <body>
+                <nav class="navbar">
+                    <h1 class="nav-title">Empatica E4 Dashboard</h1>
+                    <div class="dropdown">
+                        <button class="dropbtn">Menu principale ▼</button>
+                        <div class="dropdown-content">
+                            <a href="/dashboard_admin">Grafici</a>
+                            <a href="/statistics_admin">Statistiche</a>
+                            <a href="/register">Registrazione Nuovo Utente</a>
+                            <a href="/logout" class="logout-link">Esci (Logout)</a>
+                        </div>
                     </div>
+                </nav>
+                <div class="container">
+                    <div class="controls">
+                        <div class="control-group">
+                            <label>Utente:</label>
+                            <select id="userSelect" onchange="updateFilters()">
+                                {% for u in utenti %}
+                                <option value="{{ u }}" {% if u == selected_u %}selected{% endif %}>{{ u }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                        <div class="control-group">
+                            <label>Sensore:</label>
+                            <select id="sensorSelect" onchange="updateFilters()">
+                                <option value="ACC">Accelerazione</option>
+                                <option value="BVP">BVP</option>
+                                <option value="EDA">EDA</option>
+                                <option value="HR">HR (BPM)</option>
+                                <option value="IBI">IBI</option>
+                                <option value="TEMP">Temperatura</option>
+                            </select>
+                        </div>
+                        <div class="control-group">
+                            <label>Sessione:</label>
+                            <select id="sessionSelect" onchange="updateFilters()">
+                                <option value="01" {% if selected_s == '01' %}selected{% endif %}>01</option>
+                                <option value="02" {% if selected_s == '02' %}selected{% endif %}>02</option>
+                                <option value="03" {% if selected_s == '03' %}selected{% endif %}>03</option>
+                            </select>
+                        </div>
+                    </div>
+                    {% for s in ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"] %}
+                    <div id="card-{{ s }}" class="chart-card">
+                        <h3 style="margin:0 0 15px 0; color:#1a73e8;">{{ s }} - {{ selected_u }} (Sess. {{ selected_s }})</h3>
+                        <div style="flex-grow:1; position:relative;"><canvas id="chart-{{ s }}"></canvas></div>
+                    </div>
+                    {% endfor %}
                 </div>
-            </nav>
-            <div class="container">
-                <div class="controls">
-                    <div class="control-group">
-                        <label>Utente:</label>
-                        <select id="userSelect" onchange="updateFilters()">
-                            {% for u in utenti %}
-                            <option value="{{ u }}" {% if u == selected_u %}selected{% endif %}>{{ u }}</option>
-                            {% endfor %}
-                        </select>
-                    </div>
-                    <div class="control-group">
-                        <label>Sensore:</label>
-                        <select id="sensorSelect" onchange="updateFilters()">
-                            <option value="ACC">Accelerazione</option>
-                            <option value="BVP">BVP</option>
-                            <option value="EDA">EDA</option>
-                            <option value="HR">HR (BPM)</option>
-                            <option value="IBI">IBI</option>
-                            <option value="TEMP">Temperatura</option>
-                        </select>
-                    </div>
-                    <div class="control-group">
-                        <label>Sessione:</label>
-                        <select id="sessionSelect" onchange="updateFilters()">
-                            <option value="01" {% if selected_s == '01' %}selected{% endif %}>01</option>
-                            <option value="02" {% if selected_s == '02' %}selected{% endif %}>02</option>
-                            <option value="03" {% if selected_s == '03' %}selected{% endif %}>03</option>
-                        </select>
-                    </div>
-                </div>
-                {% for s in ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"] %}
-                <div id="card-{{ s }}" class="chart-card">
-                    <h3 style="margin:0 0 15px 0; color:#1a73e8;">{{ s }} - {{ selected_u }} (Sess. {{ selected_s }})</h3>
-                    <div style="flex-grow:1; position:relative;"><canvas id="chart-{{ s }}"></canvas></div>
-                </div>
-                {% endfor %}
-            </div>
-            <script>
-                const dataCharts = {{ data_charts|tojson }};
-                const currentS = localStorage.getItem('activeSensor') || 'ACC';
-                document.getElementById('sensorSelect').value = currentS;
-                document.getElementById('card-' + currentS).classList.add('active');
-                const ctx = document.getElementById('chart-' + currentS).getContext('2d');
-                new Chart(ctx, {
-                    type: 'line',
-                    data: {
-                        labels: dataCharts[currentS].labels,
-                        datasets: [{
-                            label: currentS,
-                            data: dataCharts[currentS].values,
-                            borderColor: '#1a73e8',
-                            backgroundColor: 'rgba(26, 115, 232, 0.1)',
-                            borderWidth: 2,
-                            tension: 0.3,
-                            fill: true,
-                            pointRadius: 2
-                        }]
-                    },
-                    options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: false } } }
-                });
-                function updateFilters() {
-                    const u = document.getElementById('userSelect').value;
-                    const sensor = document.getElementById('sensorSelect').value;
-                    const sess = document.getElementById('sessionSelect').value;
-                    localStorage.setItem('activeSensor', sensor);
-                    window.location.href = "/dashboard_admin?u=" + u + "&s=" + sess;
-                }
-                setTimeout(() => { window.location.reload(); }, 15000);
-            </script>
-        </body>
-    </html>
-    ''', utenti=lista_utenti, selected_u=selected_user, selected_s=selected_sess, data_charts=data_charts)
+                <script>
+                    const dataCharts = {{ data_charts|tojson }};
+                    const currentS = localStorage.getItem('activeSensor') || 'ACC';
+                    document.getElementById('sensorSelect').value = currentS;
+                    document.getElementById('card-' + currentS).classList.add('active');
+                    
+                    const ctx = document.getElementById('chart-' + currentS).getContext('2d');
+                    new Chart(ctx, {
+                        type: 'line',
+                        data: {
+                            labels: dataCharts[currentS].labels,
+                            datasets: [{
+                                label: currentS,
+                                data: dataCharts[currentS].values,
+                                borderColor: '#1a73e8',
+                                backgroundColor: 'rgba(26, 115, 232, 0.1)',
+                                borderWidth: 2,
+                                tension: 0.3,
+                                fill: true,
+                                pointRadius: 2
+                            }]
+                        },
+                        options: { 
+                            responsive: true, 
+                            maintainAspectRatio: false, 
+                            animation: false,
+                            scales: { y: { beginAtZero: false } } 
+                        }
+                    });
 
+                    function updateFilters() {
+                        const u = document.getElementById('userSelect').value;
+                        const sensor = document.getElementById('sensorSelect').value;
+                        const sess = document.getElementById('sessionSelect').value;
+                        localStorage.setItem('activeSensor', sensor);
+                        window.location.href = "/dashboard_admin?u=" + u + "&s=" + sess;
+                    }
+                    // Auto-refresh ogni 15 secondi per i nuovi dati
+                    setTimeout(() => { window.location.reload(); }, 15000);
+                </script>
+            </body>
+        </html>
+        ''', utenti=lista_utenti, selected_u=selected_user, selected_s=selected_sess, data_charts=data_charts)
+
+    except Exception as e:
+        return f"<h1>Errore caricamento Dashboard</h1><p>{str(e)}</p>", 500
 
 @app.route('/statistics_admin')
 def statistics_page():
