@@ -296,72 +296,77 @@ def dashboard():
         print(f"ERRORE FATALE: {e}")
         return f"<h1>Errore di caricamento</h1><p>{e}</p><a href='/logout'>Torna al login</a>"
 
-import statistics
-from scipy import stats as scipy_stats # Per la moda più semplice
-
 @app.route('/statistics_admin')
 def statistics_page():
     if 'user' not in session:
         return redirect(url_for('login'))
 
-    # 1. Recupero parametri dai filtri
-    docs_u = db.collection('dati_sensori').select(['user']).limit(200).stream()
-    lista_utenti = sorted(list(set([d.to_dict().get('user') for d in docs_u if d.to_dict().get('user')])))
-    
-    docs_s = db.collection('dati_sensori').select(['session']).limit(200).stream()
-    lista_sessioni = sorted(list(set([d.to_dict().get('session') for d in docs_s if d.to_dict().get('session')])))
+    # 1. Recupero parametri dai filtri (Utenti e Sessioni dinamici)
+    try:
+        docs_u = db.collection('dati_sensori').select(['user']).limit(200).stream()
+        lista_utenti = sorted(list(set([d.to_dict().get('user') for d in docs_u if d.to_dict().get('user')])))
+        
+        docs_s = db.collection('dati_sensori').select(['session']).limit(200).stream()
+        lista_sessioni = sorted(list(set([d.to_dict().get('session') for d in docs_s if d.to_dict().get('session')])))
 
-    selected_user = request.args.get('u', lista_utenti[0] if lista_utenti else "")
-    selected_sess = request.args.get('s', lista_sessioni[0] if lista_sessioni else "01")
+        selected_user = request.args.get('u', lista_utenti[0] if lista_utenti else "")
+        selected_sess = request.args.get('s', lista_sessioni[0] if lista_sessioni else "01")
+    except Exception as e:
+        return f"Errore nel recupero filtri: {e}"
 
     stats_results = {}
     sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
 
     # 2. Query per l'ultima settimana
-    # Calcoliamo il timestamp di 7 giorni fa
     una_settimana_fa = datetime.now() - timedelta(days=7)
 
     for s in sensori:
-        # Recuperiamo i dati dell'ultima settimana per l'utente e la sessione
-        query = db.collection('dati_sensori')\
-                  .where('user', '==', selected_user)\
-                  .where('sensor', '==', s)\
-                  .where('session', '==', selected_sess)\
-                  .where('data_ricezione', '>=', una_settimana_fa)\
-                  .stream()
-        
-        vals = []
-        for d in query:
-            try:
-                row = d.to_dict()
-                v_raw = row.get('valori', '{}')
-                v_dict = json.loads(v_raw.replace("'", '"')) if isinstance(v_raw, str) else v_raw
-                
-                if s == "ACC":
-                    mag = math.sqrt(float(v_dict.get('ax',0))**2 + float(v_dict.get('ay',0))**2 + float(v_dict.get('az',0))**2)
-                    vals.append(round(mag, 2))
-                else:
-                    vals.append(float(next(iter(v_dict.values()))))
-            except:
-                continue
+        try:
+            query = db.collection('dati_sensori')\
+                      .where('user', '==', selected_user)\
+                      .where('sensor', '==', s)\
+                      .where('session', '==', selected_sess)\
+                      .where('data_ricezione', '>=', una_settimana_fa)\
+                      .stream()
+            
+            vals = []
+            for d in query:
+                try:
+                    row = d.to_dict()
+                    v_raw = row.get('valori', '{}')
+                    v_dict = json.loads(v_raw.replace("'", '"')) if isinstance(v_raw, str) else v_raw
+                    
+                    if s == "ACC":
+                        # Magnitudo dell'accelerometro
+                        ax = float(v_dict.get('ax', 0))
+                        ay = float(v_dict.get('ay', 0))
+                        az = float(v_dict.get('az', 0))
+                        vals.append(round(math.sqrt(ax**2 + ay**2 + az**2), 2))
+                    else:
+                        # Altri sensori (prende il primo valore numerico disponibile)
+                        vals.append(float(next(iter(v_dict.values()))))
+                except:
+                    continue
 
-        # 3. Calcolo dei parametri richiesti dalla consegna
-        if len(vals) > 0:
-            # Calcolo Moda (prendiamo il valore più frequente)
-            try:
-                moda_val = statistics.mode(vals)
-            except:
-                moda_val = vals[0] # Fallback se non c'è una moda unica
+            # 3. Calcolo dei parametri (Media, Moda, Mediana, Max, Min)
+            if vals:
+                # Calcolo Moda con statistics (sen Scipy)
+                # multimode gestisce i casi con più mode restituendo una lista
+                mode_list = statistics.multimode(vals)
+                moda_val = mode_list[0] if mode_list else vals[0]
 
-            stats_results[s] = {
-                "media": round(statistics.mean(vals), 2),
-                "mediana": round(statistics.median(vals), 2),
-                "moda": round(moda_val, 2),
-                "max": round(max(vals), 2),
-                "min": round(min(vals), 2),
-                "count": len(vals)
-            }
-        else:
+                stats_results[s] = {
+                    "media": round(statistics.mean(vals), 2),
+                    "mediana": round(statistics.median(vals), 2),
+                    "moda": round(moda_val, 2),
+                    "max": round(max(vals), 2),
+                    "min": round(min(vals), 2),
+                    "count": len(vals)
+                }
+            else:
+                stats_results[s] = None
+        except Exception as e:
+            print(f"Errore calcolo sensore {s}: {e}")
             stats_results[s] = None
 
     return render_template_string(HTML_STATS_TEMPLATE, 
@@ -370,7 +375,8 @@ def statistics_page():
                                   sessioni=lista_sessioni,
                                   selected_u=selected_user, 
                                   selected_s=selected_sess)
- 
+
+# --- TEMPLATE HTML ---
 HTML_STATS_TEMPLATE = '''
 <!DOCTYPE html>
 <html>
@@ -378,28 +384,37 @@ HTML_STATS_TEMPLATE = '''
     <title>Statistiche Settimanali</title>
     <style>
         body { font-family: 'Segoe UI', sans-serif; background: #f0f2f5; margin: 0; }
-        .navbar { background: #1a73e8; color: white; padding: 15px 30px; display: flex; justify-content: space-between; }
+        .navbar { background: #1a73e8; color: white; padding: 15px 30px; display: flex; justify-content: space-between; align-items: center; }
         .container { max-width: 1100px; margin: 20px auto; padding: 20px; }
         .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
         table { width: 100%; border-collapse: collapse; margin-top: 20px; }
         th, td { padding: 12px; border-bottom: 1px solid #eee; text-align: center; }
-        th { background: #f8f9fa; color: #1a73e8; }
+        th { background: #f8f9fa; color: #1a73e8; font-size: 0.9rem; }
         .highlight { font-weight: bold; color: #1a73e8; }
-        .controls { margin-bottom: 20px; display: flex; gap: 15px; background: white; padding: 15px; border-radius: 8px; }
+        .controls { margin-bottom: 20px; display: flex; gap: 15px; background: white; padding: 15px; border-radius: 8px; align-items: center; }
+        select { padding: 8px; border-radius: 5px; border: 1px solid #ddd; }
+        .btn-back { color:white; text-decoration:none; background:rgba(255,255,255,0.2); padding:8px 15px; border-radius:5px; }
     </style>
 </head>
 <body>
     <div class="navbar">
-        <h2>Report Settimanale Empatica E4</h2>
-        <a href="/dashboard_admin" style="color:white; text-decoration:none; align-self:center;">Torna ai Grafici</a>
+        <h2 style="margin:0;">Report Settimanale Empatica E4</h2>
+        <a href="/dashboard_admin" class="btn-back">Torna ai Grafici</a>
     </div>
     <div class="container">
         <div class="controls">
-            <select id="u" onchange="upd()">{% for u in utenti %}<option value="{{u}}" {% if u==selected_u %}selected{% endif %}>{{u}}</option>{% endfor %}</select>
-            <select id="s" onchange="upd()">{% for s in sessioni %}<option value="{{s}}" {% if s==selected_s %}selected{% endif %}>{{s}}</option>{% endfor %}</select>
+            <label><b>Utente:</b></label>
+            <select id="u" onchange="upd()">
+                {% for u in utenti %}<option value="{{u}}" {% if u==selected_u %}selected{% endif %}>{{u}}</option>{% endfor %}
+            </select>
+            <label><b>Sessione:</b></label>
+            <select id="s" onchange="upd()">
+                {% for s in sessioni %}<option value="{{s}}" {% if s==selected_s %}selected{% endif %}>{{s}}</option>{% endfor %}
+            </select>
+            <span style="margin-left:auto; color: #666; font-size: 0.8rem;">Range: Ultimi 7 giorni</span>
         </div>
         <div class="card">
-            <h3>Parametri Riassuntivi (Ultimi 7 giorni)</h3>
+            <h3>Parametri Riassuntivi</h3>
             <table>
                 <thead>
                     <tr>
@@ -413,7 +428,8 @@ HTML_STATS_TEMPLATE = '''
                     </tr>
                 </thead>
                 <tbody>
-                    {% for sens, v in stats.items() %}
+                    {% for sens in ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"] %}
+                    {% set v = stats[sens] %}
                     <tr>
                         <td class="highlight">{{ sens }}</td>
                         {% if v %}
@@ -422,9 +438,9 @@ HTML_STATS_TEMPLATE = '''
                             <td>{{ v.mediana }}</td>
                             <td>{{ v.min }}</td>
                             <td>{{ v.max }}</td>
-                            <td>{{ v.count }}</td>
+                            <td><small>{{ v.count }}</small></td>
                         {% else %}
-                            <td colspan="6" style="color:gray;">Nessun dato nell'ultima settimana</td>
+                            <td colspan="6" style="color:gray; font-style: italic;">Nessun dato nell'ultima settimana</td>
                         {% endif %}
                     </tr>
                     {% endfor %}
