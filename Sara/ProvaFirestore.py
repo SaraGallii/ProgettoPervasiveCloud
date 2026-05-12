@@ -301,52 +301,64 @@ def statistics_page():
     if 'user' not in session:
         return redirect(url_for('login'))
 
-    docs_u = db.collection('dati_sensori').select(['user']).stream()
-    lista_utenti = sorted(list(set([d.to_dict()['user'] for d in docs_u])))
-    
-    docs_s = db.collection('dati_sensori').select(['session']).stream()
-    lista_sessioni = sorted(list(set([d.to_dict()['session'] for d in docs_s])))
-    
-    if not lista_utenti: lista_utenti = ["Nessun dato"]
-    if not lista_sessioni: lista_sessioni = ["01"]
-
-    selected_user = request.args.get('u', lista_utenti[0])
-    selected_sess = request.args.get('s', lista_sessioni[0])
-    sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
-    stats_results = {}
-
-    for s in sensori:
-        # Recupero dati per statistiche (ultimi 7 giorni simulati)
-        query = db.collection('dati_sensori')\
-                  .where('user', '==', selected_user)\
-                  .where('sensor', '==', s)\
-                  .where('session', '==', selected_sess)\
-                  .stream()
+    try:
+        # 1. Recupero Utenti e Sessioni per i filtri (come nella Dashboard)
+        docs_u = db.collection('dati_sensori').select(['user']).limit(200).stream()
+        lista_utenti = sorted(list(set([d.to_dict().get('user') for d in docs_u if d.to_dict().get('user')])))
         
-        raw_values = []
-        for d in query:
-            r = d.to_dict()
-            try:
-                val = json.loads(r['valori'].replace("'", '"'))
-                if s == "ACC":
-                    ax, ay, az = float(val.get('ax', 0)), float(val.get('ay', 0)), float(val.get('az', 0))
-                    raw_values.append(math.sqrt(ax**2 + ay**2 + az**2))
-                else:
-                    raw_values.append(float(list(val.values())[0]))
-            except: continue
+        docs_s = db.collection('dati_sensori').select(['session']).limit(200).stream()
+        lista_sessioni = sorted(list(set([d.to_dict().get('session') for d in docs_s if d.to_dict().get('session')])))
 
-        if raw_values:
-            stats_results[s] = {
-                "mean": round(statistics.mean(raw_values), 2),
-                "median": round(statistics.median(raw_values), 2),
-                "mode": round(statistics.mode(raw_values), 2),
-                "min": round(min(raw_values), 2),
-                "max": round(max(raw_values), 2),
-            }
-        else:
-            stats_results[s] = None
-    
-    return render_template_string('''
+        if not lista_utenti: lista_utenti = ["Nessun dato"]
+        if not lista_sessioni: lista_sessioni = ["01"]
+
+        # 2. Parametri scelti dall'utente
+        selected_user = request.args.get('u', lista_utenti[0])
+        selected_sess = request.args.get('s', lista_sessioni[0])
+        
+        sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
+        stats_results = {}
+
+        for s in sensori:
+            # Query su Firestore per TUTTI i dati della sessione/utente/sensore
+            query = db.collection('dati_sensori')\
+                      .where('user', '==', selected_user)\
+                      .where('sensor', '==', s)\
+                      .where('session', '==', selected_sess)\
+                      .stream()
+            
+            raw_values = []
+            for d in query:
+                r = d.to_dict()
+                try:
+                    # Parsing dei valori (gestione stringa vs mappa)
+                    val_raw = r.get('valori', '{}')
+                    val = json.loads(val_raw.replace("'", '"')) if isinstance(val_raw, str) else val_raw
+                    
+                    if s == "ACC":
+                        ax = float(val.get('ax', 0))
+                        ay = float(val.get('ay', 0))
+                        az = float(val.get('az', 0))
+                        raw_values.append(math.sqrt(ax**2 + ay**2 + az**2))
+                    else:
+                        # Prende il primo valore numerico (es. il valore di 'hr' o 'temp')
+                        raw_values.append(float(next(iter(val.values()))))
+                except:
+                    continue
+
+            # Calcolo statistiche solo se ci sono dati
+            if raw_values:
+                stats_results[s] = {
+                    "mean": round(statistics.mean(raw_values), 2),
+                    "median": round(statistics.median(raw_values), 2),
+                    "min": round(min(raw_values), 2),
+                    "max": round(max(raw_values), 2),
+                    "count": len(raw_values)
+                }
+            else:
+                stats_results[s] = None
+
+        return render_template_string('''
     <html>
         <head>
             <title>Statistiche Empatica E4</title>
@@ -354,34 +366,34 @@ def statistics_page():
                 body { font-family: 'Segoe UI', sans-serif; background: #f0f2f5; margin: 0; padding: 0; }
                 .navbar { background: #1a73e8; color: white; padding: 0 25px; height: 60px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
                 .container { max-width: 1000px; margin: 20px auto; padding: 0 20px; }
-                .controls { background: white; padding: 15px 25px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); display: flex; gap: 20px; flex-wrap: wrap; }
-                .control-group { display: flex; align-items: center; gap: 8px; }
+                .controls { background: white; padding: 15px 25px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); display: flex; gap: 20px; align-items: center; }
                 select { padding: 8px; border-radius: 6px; border: 1px solid #ddd; background: white; }
                 .card { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); }
                 table { width: 100%; border-collapse: collapse; margin-top: 10px; }
                 th, td { padding: 15px; text-align: left; border-bottom: 1px solid #eee; }
                 th { background: #f8f9fa; color: #1a73e8; font-weight: bold; text-transform: uppercase; font-size: 0.85rem; }
                 .no-data { color: #999; font-style: italic; text-align: center; }
+                .btn-back { color:white; text-decoration:none; font-weight:bold; background:rgba(255,255,255,0.2); padding:8px 15px; border-radius:6px; }
             </style>
         </head>
         <body>
             <nav class="navbar">
-                <h1 style="font-size: 1.3rem; margin:0;">Statistiche Settimanali</h1>
-                <a href="/dashboard_admin" style="color:white; text-decoration:none; font-weight:bold; background:rgba(255,255,255,0.2); padding:8px 15px; border-radius:6px;">Torna ai Grafici</a>
+                <h1 style="font-size: 1.3rem; margin:0;">Analisi Statistica</h1>
+                <a href="/dashboard_admin" class="btn-back">Torna ai Grafici</a>
             </nav>
             <div class="container">
                 <div class="controls">
-                    <div class="control-group">
+                    <div>
                         <label>Utente:</label>
-                        <select id="userSelect" onchange="updateFilters()">
+                        <select id="userSelect" onchange="update()">
                             {% for u in utenti %}
                             <option value="{{ u }}" {% if u == selected_u %}selected{% endif %}>{{ u }}</option>
                             {% endfor %}
                         </select>
                     </div>
-                    <div class="control-group">
+                    <div>
                         <label>Sessione:</label>
-                        <select id="sessionSelect" onchange="updateFilters()">
+                        <select id="sessionSelect" onchange="update()">
                             {% for s in sessioni %}
                             <option value="{{ s }}" {% if s == selected_s %}selected{% endif %}>{{ s }}</option>
                             {% endfor %}
@@ -389,29 +401,29 @@ def statistics_page():
                     </div>
                 </div>
                 <div class="card">
-                    <h3 style="margin:0 0 20px 0; color:#1a73e8;">Riepilogo: Utente {{ selected_u }} - Sessione {{ selected_s }}</h3>
+                    <h3 style="margin:0 0 20px 0; color:#1a73e8;">Riepilogo: {{ selected_u }} - Sessione {{ selected_s }}</h3>
                     <table>
                         <thead>
                             <tr>
                                 <th>Sensore</th>
                                 <th>Media</th>
                                 <th>Mediana</th>
-                                <th>Moda</th>
                                 <th>Min</th>
                                 <th>Max</th>
+                                <th>Campioni</th>
                             </tr>
                         </thead>
                         <tbody>
                             {% for s in ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"] %}
-                            {% set vals = data[s] %}
+                            {% set v = stats[s] %}
                             <tr>
-                                <td><strong style="color:#333;">{{ s }}</strong></td>
-                                {% if vals %}
-                                <td>{{ vals.mean }}</td>
-                                <td>{{ vals.median }}</td>
-                                <td>{{ vals.mode }}</td>
-                                <td>{{ vals.min }}</td>
-                                <td>{{ vals.max }}</td>
+                                <td><strong>{{ s }}</strong></td>
+                                {% if v %}
+                                <td>{{ v.mean }}</td>
+                                <td>{{ v.median }}</td>
+                                <td>{{ v.min }}</td>
+                                <td>{{ v.max }}</td>
+                                <td><small>{{ v.count }}</small></td>
                                 {% else %}
                                 <td colspan="5" class="no-data">Nessun dato trovato</td>
                                 {% endif %}
@@ -422,16 +434,19 @@ def statistics_page():
                 </div>
             </div>
             <script>
-                function updateFilters() {
+                function update() {
                     const u = document.getElementById('userSelect').value;
-                    const sess = document.getElementById('sessionSelect').value;
-                    window.location.href = "/statistics_admin?u=" + u + "&s=" + sess;
+                    const s = document.getElementById('sessionSelect').value;
+                    window.location.href = "/statistics_admin?u=" + u + "&s=" + s;
                 }
             </script>
         </body>
     </html>
-    ''', data=stats_results, utenti=lista_utenti, sessioni=lista_sessioni, selected_u=selected_user, selected_s=selected_sess)
+    ''', stats=stats_results, utenti=lista_utenti, sessioni=lista_sessioni, selected_u=selected_user, selected_s=selected_sess)
 
+    except Exception as e:
+        return f"<h1>Errore statistiche:</h1><p>{e}</p><a href='/dashboard_admin'>Torna indietro</a>"
+    
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if 'user' not in session or session.get('user') != 'admin':
