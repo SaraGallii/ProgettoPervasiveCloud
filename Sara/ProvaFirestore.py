@@ -10,8 +10,8 @@ app.secret_key = "p4ssw0rd"
 
 # --- INIZIALIZZAZIONE FIRESTORE ---
 # Se sei su una VM Google Cloud con permessi corretti, basta firestore.Client()
-# Altrimenti usa: firestore.Client.from_service_account_json('path/to/key.json').
-db = firestore.Client()
+# Altrimenti usa: firestore.Client.from_service_account_json('path/to/key.json')
+db = firestore.Client.from_service_account_json('progetto-pcloud-5-b8e46802d217.json')
 
 def init_db():
     """Inizializza l'utente admin se non esiste su Firestore"""
