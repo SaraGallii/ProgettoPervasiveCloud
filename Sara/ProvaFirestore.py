@@ -48,42 +48,44 @@ def login():
     if request.method == 'POST':
         username = request.form.get('username')
         password = request.form.get('password')
-        tipo_utente = request.form.get('tipo_utente')
         
-        user_doc = db.collection('utenti').document(username).get()
+        print(f"Tentativo di login per: {username}") # Debug
         
-        if user_doc.exists:
-            user_data = user_doc.to_dict()
-            if user_data.get('password') == password:
-                session['user'] = username
-                session['id_utente'] = user_data.get('id_utente')
-                session['tipo'] = tipo_utente
-                return redirect(url_for('dashboard'))
+        try:
+            user_doc = db.collection('utenti').document(username).get()
+            
+            if user_doc.exists:
+                user_data = user_doc.to_dict()
+                print(f"Utente trovato in DB. Controllo password...") # Debug
+                
+                if str(user_data.get('password')) == str(password):
+                    session['user'] = username
+                    session['tipo'] = request.form.get('tipo_utente')
+                    print("Login successo! Reindirizzamento...") # Debug
+                    return redirect(url_for('dashboard'))
+                else:
+                    print("Password errata.")
+                    error = True
             else:
+                print("Utente non esistente su Firestore.")
                 error = True
-        else:
+        except Exception as e:
+            print(f"Errore durante il login: {e}")
             error = True
 
     return render_template_string('''
     <html>
     <body style="font-family:sans-serif; display:flex; justify-content:center; align-items:center; height:100vh; background:#f0f2f5; margin:0;">
         <form method="post" style="background:white; padding:2rem; border-radius:12px; box-shadow:0 10px 25px rgba(0,0,0,0.1); width:320px;">
-            <h2 style="color:#1a73e8; margin-top:0; text-align:center; font-size:1.2rem;">Login Empatica E4</h2>
-            <label style="font-size:0.9rem; color:#555;">Tipologia Utente:</label>
-            <select name="tipo_utente" style="width:100%; margin-bottom:15px; padding:10px; border:1px solid #ddd; border-radius:6px; background:white;">
+            <h2 style="color:#1a73e8; text-align:center;">Empatica E4 Login</h2>
+            <select name="tipo_utente" style="width:100%; margin-bottom:15px; padding:10px; border-radius:6px; border:1px solid #ddd;">
                 <option value="admin">Admin</option>
                 <option value="utente">Utente</option>
             </select>
-            <label style="font-size:0.9rem; color:#555;">Username:</label>
-            <input type="text" name="username" required style="width:100%; margin-bottom:15px; padding:10px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;">
-            <label style="font-size:0.9rem; color:#555;">Password:</label>
-            <input type="password" name="password" required style="width:100%; margin-bottom:25px; padding:10px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;">
-            <input type="submit" value="Accedi" style="width:100%; padding:12px; background:#1a73e8; color:white; border:none; border-radius:6px; cursor:pointer; font-weight:bold; font-size:1rem;">
-            {% if error %}
-            <div style="margin-top:20px; color:#d93025; text-align:center; font-weight:bold; font-size:0.85rem; padding:10px; background:#fbe9e7; border-radius:4px;">
-                ATTENZIONE: CREDENZIALI SBAGLIATE
-            </div>
-            {% endif %}
+            <input type="text" name="username" placeholder="Username" required style="width:100%; margin-bottom:15px; padding:10px; border-radius:6px; border:1px solid #ddd; box-sizing:border-box;">
+            <input type="password" name="password" placeholder="Password" required style="width:100%; margin-bottom:20px; padding:10px; border-radius:6px; border:1px solid #ddd; box-sizing:border-box;">
+            <input type="submit" value="Accedi" style="width:100%; padding:12px; background:#1a73e8; color:white; border:none; border-radius:6px; cursor:pointer; font-weight:bold;">
+            {% if error %}<p style="color:red; text-align:center; font-size:0.8rem; margin-top:10px;">Credenziali errate o errore server</p>{% endif %}
         </form>
     </body>
     </html>
@@ -94,190 +96,204 @@ def logout():
     session.clear()
     return redirect(url_for('login'))
 
-# --- ROTTA DASHBOARD ---
-# --- ROTTA DASHBOARD ---
+# --- ROTTA DASHBOARD COMPLETA ---
 @app.route('/dashboard_admin')
 def dashboard():
+    # 1. Controllo Sessione rapido
     if 'user' not in session:
         return redirect(url_for('login'))
 
+    print(f"DEBUG: Accesso dashboard per l'utente {session['user']}")
+
     try:
-        # 1. Recupero lista utenti unica dai dati reali presenti su Firestore
-        docs_u = db.collection('dati_sensori').select(['user']).stream()
-        lista_utenti = sorted(list(set([d.to_dict().get('user') for d in docs_u if d.to_dict().get('user')])))
-        
-        # Gestione database vuoto
-        if not lista_utenti: 
+        # 2. Recupero Utenti (Limitato a 50 per evitare blocchi se il DB è grande)
+        # Cerchiamo di ottenere solo i nomi degli utenti unici
+        try:
+            docs_u = db.collection('dati_sensori').select(['user']).limit(100).stream()
+            lista_utenti = sorted(list(set([d.to_dict().get('user') for d in docs_u if d.to_dict().get('user')])))
+        except Exception as e:
+            print(f"Errore recupero utenti: {e}")
+            lista_utenti = []
+
+        # Se il database è vuoto o la query fallisce
+        if not lista_utenti:
             lista_utenti = ["Nessun dato"]
 
-        # Parametri di selezione (da URL o default)
+        # 3. Parametri URL
         selected_user = request.args.get('u', lista_utenti[0])
         selected_sess = request.args.get('s', '01') 
         
         sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
         data_charts = {}
 
+        # 4. Recupero Dati per ogni sensore
         for s in sensori:
-            # Query filtrata e ordinata (richiede l'indice che hai creato)
-            query = db.collection('dati_sensori')\
-                      .where('user', '==', selected_user)\
-                      .where('sensor', '==', s)\
-                      .where('session', '==', selected_sess)\
-                      .order_by('data_ricezione', direction=firestore.Query.DESCENDING)\
-                      .limit(50)
-            
-            results = [d.to_dict() for d in query.stream()]
-            results.reverse() # Invertiamo per avere l'ordine temporale corretto sul grafico
-            
-            labels = [r.get('timestamp', '--:--') for r in results]
-            values = []
-            
-            for r in results:
-                try:
-                    # Gestione flessibile: Firestore può restituire stringhe o mappe
+            try:
+                query = db.collection('dati_sensori')\
+                          .where('user', '==', selected_user)\
+                          .where('sensor', '==', s)\
+                          .where('session', '==', selected_sess)\
+                          .order_by('data_ricezione', direction=firestore.Query.DESCENDING)\
+                          .limit(40) # Limitiamo i punti per caricare velocemente
+                
+                results = [d.to_dict() for d in query.stream()]
+                results.reverse() # Ordine cronologico per Chart.js
+                
+                labels = [r.get('timestamp', '') for r in results]
+                values = []
+                
+                for r in results:
                     val_raw = r.get('valori', '{}')
-                    if isinstance(val_raw, str):
-                        val = json.loads(val_raw.replace("'", '"'))
-                    else:
-                        val = val_raw
+                    # Pulizia stringa se Firestore ha salvato JSON come stringa
+                    val = json.loads(val_raw.replace("'", '"')) if isinstance(val_raw, str) else val_raw
                     
                     if s == "ACC":
-                        # Calcolo Magnitudo Accelerazione
                         ax = float(val.get('ax', val.get('x', 0)))
                         ay = float(val.get('ay', val.get('y', 0)))
                         az = float(val.get('az', val.get('z', 0)))
-                        mag = math.sqrt(ax**2 + ay**2 + az**2)
-                        values.append(round(mag, 3))
+                        values.append(round(math.sqrt(ax**2 + ay**2 + az**2), 2))
                     else:
-                        # Per gli altri sensori, prendiamo il primo valore numerico disponibile
-                        # (es. {"hr": "74.63"} diventa 74.63)
-                        valore_numerico = float(next(iter(val.values())))
-                        values.append(valore_numerico)
-                except:
-                    values.append(0)
-            
-            data_charts[s] = {"labels": labels, "values": values}
+                        # Prende il primo valore numerico nel dizionario
+                        values.append(float(next(iter(val.values()))))
+                
+                data_charts[s] = {"labels": labels, "values": values}
+            except Exception as e:
+                print(f"Errore sensore {s}: {e}")
+                data_charts[s] = {"labels": [], "values": []}
 
+        # 5. Ritorno dell'HTML (Template Integrato)
         return render_template_string('''
-        <html>
-            <head>
-                <title>Dashboard Empatica E4</title>
-                <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-                <style>
-                    body { font-family: 'Segoe UI', sans-serif; background: #f0f2f5; margin: 0; padding: 0; }
-                    .navbar { background: #1a73e8; color: white; padding: 0 25px; height: 60px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 10px rgba(0,0,0,0.1); position: sticky; top: 0; z-index: 1000; }
-                    .nav-title { margin: 0; font-size: 1.3rem; }
-                    .dropdown { position: relative; display: inline-block; }
-                    .dropbtn { background-color: rgba(255,255,255,0.15); color: white; padding: 8px 16px; font-size: 14px; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
-                    .dropdown-content { display: none; position: absolute; right: 0; background-color: white; min-width: 200px; box-shadow: 0px 8px 16px rgba(0,0,0,0.2); z-index: 1; border-radius: 4px; overflow: hidden; }
-                    .dropdown-content a { color: #333; padding: 12px 16px; text-decoration: none; display: block; font-size: 14px; }
-                    .dropdown-content a:hover { background-color: #f1f1f1; }
-                    .dropdown:hover .dropdown-content { display: block; }
-                    .container { max-width: 1000px; margin: 20px auto; padding: 0 20px; }
-                    .controls { background: white; padding: 15px 25px; border-radius: 12px; margin-bottom: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.05); display: flex; gap: 20px; flex-wrap: wrap; }
-                    .control-group { display: flex; align-items: center; gap: 8px; }
-                    select { padding: 6px; border-radius: 6px; border: 1px solid #ddd; }
-                    .chart-card { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); height: 450px; display: none; }
-                    .chart-card.active { display: flex; flex-direction: column; }
-                    .logout-link { color: #d93025 !important; font-weight: bold; border-top: 1px solid #eee; }
-                </style>
-            </head>
-            <body>
-                <nav class="navbar">
-                    <h1 class="nav-title">Empatica E4 Dashboard</h1>
-                    <div class="dropdown">
-                        <button class="dropbtn">Menu principale ▼</button>
-                        <div class="dropdown-content">
-                            <a href="/dashboard_admin">Grafici</a>
-                            <a href="/statistics_admin">Statistiche</a>
-                            <a href="/register">Registrazione Nuovo Utente</a>
-                            <a href="/logout" class="logout-link">Esci (Logout)</a>
-                        </div>
-                    </div>
-                </nav>
-                <div class="container">
-                    <div class="controls">
-                        <div class="control-group">
-                            <label>Utente:</label>
-                            <select id="userSelect" onchange="updateFilters()">
-                                {% for u in utenti %}
-                                <option value="{{ u }}" {% if u == selected_u %}selected{% endif %}>{{ u }}</option>
-                                {% endfor %}
-                            </select>
-                        </div>
-                        <div class="control-group">
-                            <label>Sensore:</label>
-                            <select id="sensorSelect" onchange="updateFilters()">
-                                <option value="ACC">Accelerazione</option>
-                                <option value="BVP">BVP</option>
-                                <option value="EDA">EDA</option>
-                                <option value="HR">HR (BPM)</option>
-                                <option value="IBI">IBI</option>
-                                <option value="TEMP">Temperatura</option>
-                            </select>
-                        </div>
-                        <div class="control-group">
-                            <label>Sessione:</label>
-                            <select id="sessionSelect" onchange="updateFilters()">
-                                <option value="01" {% if selected_s == '01' %}selected{% endif %}>01</option>
-                                <option value="02" {% if selected_s == '02' %}selected{% endif %}>02</option>
-                                <option value="03" {% if selected_s == '03' %}selected{% endif %}>03</option>
-                            </select>
-                        </div>
-                    </div>
-                    {% for s in ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"] %}
-                    <div id="card-{{ s }}" class="chart-card">
-                        <h3 style="margin:0 0 15px 0; color:#1a73e8;">{{ s }} - {{ selected_u }} (Sess. {{ selected_s }})</h3>
-                        <div style="flex-grow:1; position:relative;"><canvas id="chart-{{ s }}"></canvas></div>
-                    </div>
-                    {% endfor %}
-                </div>
-                <script>
-                    const dataCharts = {{ data_charts|tojson }};
-                    const currentS = localStorage.getItem('activeSensor') || 'ACC';
-                    document.getElementById('sensorSelect').value = currentS;
-                    document.getElementById('card-' + currentS).classList.add('active');
-                    
-                    const ctx = document.getElementById('chart-' + currentS).getContext('2d');
-                    new Chart(ctx, {
-                        type: 'line',
-                        data: {
-                            labels: dataCharts[currentS].labels,
-                            datasets: [{
-                                label: currentS,
-                                data: dataCharts[currentS].values,
-                                borderColor: '#1a73e8',
-                                backgroundColor: 'rgba(26, 115, 232, 0.1)',
-                                borderWidth: 2,
-                                tension: 0.3,
-                                fill: true,
-                                pointRadius: 2
-                            }]
-                        },
-                        options: { 
-                            responsive: true, 
-                            maintainAspectRatio: false, 
-                            animation: false,
-                            scales: { y: { beginAtZero: false } } 
-                        }
-                    });
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <title>Empatica E4 - Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f4f7f9; margin: 0; color: #333; }
+        .navbar { background: #1a73e8; color: white; padding: 15px 30px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .container { max-width: 1100px; margin: 30px auto; padding: 0 20px; }
+        .card-controls { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); margin-bottom: 25px; display: flex; gap: 20px; align-items: center; }
+        select { padding: 10px; border-radius: 5px; border: 1px solid #ddd; font-size: 14px; background: white; }
+        .chart-container { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 10px 20px rgba(0,0,0,0.05); height: 500px; }
+        .nav-links a { color: white; text-decoration: none; margin-left: 20px; font-weight: 500; font-size: 0.9rem; }
+        .nav-links a:hover { text-decoration: underline; }
+        h3 { margin-top: 0; color: #1a73e8; }
+    </style>
+</head>
+<body>
+    <div class="navbar">
+        <h2 style="margin:0; font-size: 1.4rem;">Empatica E4 Dashboard</h2>
+        <div class="nav-links">
+            <a href="/dashboard_admin">Dashboard</a>
+            <a href="/statistics_admin">Statistiche</a>
+            <a href="/register">Nuovo Utente</a>
+            <a href="/logout" style="color: #ffcccc;">Logout</a>
+        </div>
+    </div>
 
-                    function updateFilters() {
-                        const u = document.getElementById('userSelect').value;
-                        const sensor = document.getElementById('sensorSelect').value;
-                        const sess = document.getElementById('sessionSelect').value;
-                        localStorage.setItem('activeSensor', sensor);
-                        window.location.href = "/dashboard_admin?u=" + u + "&s=" + sess;
-                    }
-                    // Auto-refresh ogni 15 secondi per i nuovi dati
-                    setTimeout(() => { window.location.reload(); }, 15000);
-                </script>
-            </body>
-        </html>
+    <div class="container">
+        <div class="card-controls">
+            <div>
+                <label><b>Utente:</b></label>
+                <select id="userSelect" onchange="update()">
+                    {% for u in utenti %}
+                    <option value="{{ u }}" {% if u == selected_u %}selected{% endif %}>{{ u }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div>
+                <label><b>Sensore:</b></label>
+                <select id="sensorSelect" onchange="changeSensor()">
+                    <option value="ACC">Accelerometro (Magnitudo)</option>
+                    <option value="BVP">BVP (Blood Volume Pulse)</option>
+                    <option value="EDA">EDA (Elettrodermica)</option>
+                    <option value="HR">Frequenza Cardiaca (HR)</option>
+                    <option value="IBI">IBI (Inter-Beat Interval)</option>
+                    <option value="TEMP">Temperatura</option>
+                </select>
+            </div>
+            <div>
+                <label><b>Sessione:</b></label>
+                <select id="sessSelect" onchange="update()">
+                    <option value="01" {% if selected_s == '01' %}selected{% endif %}>01</option>
+                    <option value="02" {% if selected_s == '02' %}selected{% endif %}>02</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="chart-container">
+            <h3 id="chartTitle">Caricamento grafico...</h3>
+            <div style="height: 400px; position: relative;">
+                <canvas id="mainChart"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const allData = {{ data_charts|tojson }};
+        let currentChart = null;
+
+        function render(sensorId) {
+            const ctx = document.getElementById('mainChart').getContext('2d');
+            const data = allData[sensorId];
+            
+            document.getElementById('chartTitle').innerText = sensorId + " - Dati in tempo reale";
+
+            if (currentChart) currentChart.destroy();
+
+            currentChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: data.labels,
+                    datasets: [{
+                        label: sensorId,
+                        data: data.values,
+                        borderColor: '#1a73e8',
+                        backgroundColor: 'rgba(26, 115, 232, 0.1)',
+                        borderWidth: 3,
+                        tension: 0.4,
+                        fill: true,
+                        pointRadius: 3
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: { y: { beginAtZero: false, grid: { color: '#f0f0f0' } }, x: { grid: { display: false } } }
+                }
+            });
+        }
+
+        function update() {
+            const u = document.getElementById('userSelect').value;
+            const s = document.getElementById('sessSelect').value;
+            window.location.href = `/dashboard_admin?u=${u}&s=${s}`;
+        }
+
+        function changeSensor() {
+            const s = document.getElementById('sensorSelect').value;
+            localStorage.setItem('lastSensor', s);
+            render(s);
+        }
+
+        // Inizializzazione
+        window.onload = () => {
+            const last = localStorage.getItem('lastSensor') || 'HR';
+            document.getElementById('sensorSelect').value = last;
+            render(last);
+        };
+
+        // Refresh automatico ogni 20 secondi
+        setTimeout(() => location.reload(), 20000);
+    </script>
+</body>
+</html>
         ''', utenti=lista_utenti, selected_u=selected_user, selected_s=selected_sess, data_charts=data_charts)
 
     except Exception as e:
-        return f"<h1>Errore caricamento Dashboard</h1><p>{str(e)}</p>", 500
+        print(f"ERRORE FATALE: {e}")
+        return f"<h1>Errore di caricamento</h1><p>{e}</p><a href='/logout'>Torna al login</a>"
 
 @app.route('/statistics_admin')
 def statistics_page():
