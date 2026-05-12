@@ -76,7 +76,8 @@ def login():
 
         if user_doc:
             session['user'] = user_doc['username']
-            session['id_utente'] = user_doc['id_utente']
+            # Sostituisci la riga 79 con questa:
+            session['id_utente'] = user_doc.get('id_utente', 'ALL')
             session['tipo'] = tipo_utente
             return redirect(url_for('dashboard'))
         else:
