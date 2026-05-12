@@ -218,6 +218,7 @@ def dashboard():
                 <select id="sessSelect" onchange="update()">
                     <option value="01" {% if selected_s == '01' %}selected{% endif %}>01</option>
                     <option value="02" {% if selected_s == '02' %}selected{% endif %}>02</option>
+                    <option value="03" {% if selected_s == '03' %}selected{% endif %}>03</option>
                 </select>
             </div>
         </div>
