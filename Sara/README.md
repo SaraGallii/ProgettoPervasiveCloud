@@ -5,7 +5,6 @@ Aprire due terminali in contemporanea e digitare:
 python sensor.py (client)
 python server.py (server)
 
-http://127.0.0.1:5000/data
 
 #FUNZIONAMENTO HTTP. PUNTO 1
 La comunicazione avviene tramite HTTP (HyperText Transfer Protocol).Nel Client (sensor.py) il protocollo è rappresentato dalla libreria requests. Quando si scrive requests.post(...), s sta inviando un "pacchetto" HTTP di tipo POST (usato per inviare dati) verso il server.
@@ -59,7 +58,7 @@ python server_pt5.py
 http://127.0.0.1:5000/statistics
 
 FILE PROVA
-run : 
+run : python .\Sara\sensor.py
 python sensor.py (CLIENT)
 python Prova.py (SERVER)
 http://127.0.0.1:5000/login
@@ -79,3 +78,6 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 PER MACCHINA VIRTUALE (Google Cloud):
 
 sudo apt update && sudo apt upgrade
+
+CERCARE QUA LA ROBA: 
+http://34.154.16.97:5000
