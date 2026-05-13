@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, session, redirect, url_for, render_template_string
 from datetime import datetime,timezone, timedelta
+from dateutil import parser
 import json
 import math
 import statistics
@@ -306,7 +307,6 @@ def dashboard():
     except Exception as e:
         print(f"ERRORE FATALE: {e}")
         return f"<h1>Errore di caricamento</h1><p>{e}</p><a href='/logout'>Torna al login</a>"
-    
 @app.route('/statistics_admin')
 def statistics_admin():
     if 'user' not in session or session.get('tipo') != 'admin':
@@ -327,7 +327,7 @@ def statistics_admin():
         for sess in ['01', '02', '03']:
             report_finale[sess] = []
             
-            # 1. Trova l'ultimo timestamp disponibile nel dataset per questo utente/sessione
+            # 1. Trova l'ultimo timestamp disponibile
             query_last = db.collection('dati_sensori')\
                            .where('user', '==', selected_user)\
                            .where('session', '==', sess)\
@@ -337,8 +337,23 @@ def statistics_admin():
             if not query_last:
                 continue
                 
-            data_fine = query_last[0].to_dict()['timestamp']
-            data_inizio = data_fine - timedelta(days=7) # Finestra di 7 giorni nel 2021
+            # RECUPERO E CONVERSIONE DATA
+            raw_timestamp = query_last[0].to_dict()['timestamp']
+            
+            try:
+                if isinstance(raw_timestamp, str):
+                    # Se è una stringa, usiamo il parser per convertirla in datetime
+                    data_fine = parser.parse(raw_timestamp)
+                else:
+                    # Se è già un oggetto timestamp di Firestore
+                    data_fine = raw_timestamp
+                
+                # Ora la sottrazione funzionerà correttamente
+                data_inizio = data_fine - timedelta(days=7)
+                
+            except Exception as e:
+                print(f"Errore conversione data: {e}")
+                continue
 
             sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
             for s in sensori:
@@ -365,12 +380,12 @@ def statistics_admin():
                     except: continue
 
                 if valori:
-                    # 3. Calcolo parametri semplificati
+                    # 3. Calcolo parametri
                     s_media = round(statistics.mean(valori), 2)
                     s_min = round(min(valori), 2)
                     s_max = round(max(valori), 2)
 
-                    # 4. Salvataggio su Firestore nella collezione 'statistiche_settimanali'
+                    # 4. Salvataggio su Firestore
                     stat_id = f"{selected_user}_{sess}_{s}"
                     db.collection('statistiche_settimanali').document(stat_id).set({
                         'user': selected_user,
@@ -387,7 +402,8 @@ def statistics_admin():
                         'sensor': s, 'media': s_media, 'min': s_min, 'max': s_max
                     })
 
-    return render_template_string(HTML_STATS_SIMPLE, utenti=lista_utenti, report=report_finale, sel_u=selected_user)
+    return render_template_string(HTML_STATS_SIMPLE, utenti=lista_utenti, report=report_finale, sel_u=selected_user)    
+
 
 HTML_STATS_SIMPLE = '''
 <!DOCTYPE html>
