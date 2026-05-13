@@ -312,26 +312,25 @@ def statistics_page():
     if 'user' not in session:
         return redirect(url_for('login'))
 
-    # 1. Recupero parametri dai menu a tendina (per la visualizzazione)
-    # Usiamo set() per evitare duplicati e sorted() per l'ordine (01, 02, 03...)
-    docs_u = db.collection('dati_sensori').select(['user']).limit(500).stream()
+    # 1. Recupero parametri (User e Session)
+    docs_u = db.collection('dati_sensori').select(['user']).limit(200).stream()
     lista_utenti = sorted(list(set([d.to_dict().get('user') for d in docs_u if d.to_dict().get('user')])))
     
-    docs_s = db.collection('dati_sensori').select(['session']).limit(500).stream()
+    docs_s = db.collection('dati_sensori').select(['session']).limit(200).stream()
     lista_sessioni = sorted(list(set([d.to_dict().get('session') for d in docs_s if d.to_dict().get('session')])))
 
-    # Recupero selezione attuale dall'URL
     u_raw = request.args.get('u', "")
     selected_user = str(u_raw).zfill(2) if u_raw else (lista_utenti[0] if lista_utenti else "01")
     
     s_raw = request.args.get('s', "")
-    selected_sess = str(s_raw).zfill(2) if s_raw else (lista_sessioni[0] if lista_sessioni else "01")
+    selected_sess = str(s_raw).zfill(2) if s_raw else "01"
 
     stats_results = {}
-    sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
+    sensori_nomi = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
     
     try:
-        # Cerchiamo l'ultimo record della sessione specifica per trovare la data di fine
+        # Cerchiamo l'ultimo record per QUELLO specifico utente e QUELLA sessione
+        # Nota: togliamo il filtro 'sensor'== 'ACC' per essere sicuri di trovare QUALSIASI dato
         last_record_query = db.collection('dati_sensori')\
                                 .where('user', '==', selected_user)\
                                 .where('session', '==', selected_sess)\
@@ -342,8 +341,7 @@ def statistics_page():
             ultima_data_db = last_record_query[0].to_dict().get('timestamp')
             data_inizio_filtro = ultima_data_db - timedelta(days=7)
             
-            for s in sensori:
-                # Query specifica per UTENTE, SESSIONE e SENSORE
+            for s in sensori_nomi:
                 query = db.collection('dati_sensori')\
                           .where('user', '==', selected_user)\
                           .where('session', '==', selected_sess)\
@@ -353,25 +351,36 @@ def statistics_page():
                 
                 vals = []
                 for d in query:
-                    v_raw = d.to_dict().get('valori', {})
-                    
-                    # Gestione flessibile del dizionario 'valori'
+                    row = d.to_dict()
+                    v_raw = row.get('valori', {})
+
+                    # Forza la conversione se v_raw è una stringa JSON
+                    if isinstance(v_raw, str):
+                        try: v_raw = json.loads(v_raw.replace("'", '"'))
+                        except: continue
+
                     if isinstance(v_raw, dict):
                         if s == "ACC":
-                            # Calcolo modulo accelerazione se i campi esistono
                             try:
-                                ax = float(v_raw.get('ax', 0))
-                                ay = float(v_raw.get('ay', 0))
-                                az = float(v_raw.get('az', 0))
+                                # Gestiamo sia ax che AX
+                                ax = float(v_raw.get('ax') or v_raw.get('AX') or 0)
+                                ay = float(v_raw.get('ay') or v_raw.get('AY') or 0)
+                                az = float(v_raw.get('az') or v_raw.get('AZ') or 0)
                                 vals.append(math.sqrt(ax**2 + ay**2 + az**2))
                             except: continue
                         else:
-                            # Prende il primo valore numerico disponibile (es. bvp, hr, temp...)
-                            for k, val in v_raw.items():
-                                try:
-                                    vals.append(float(val))
-                                    break # Prendi solo il primo valore della mappa
-                                except: continue
+                            # Prende il primo valore disponibile trasformando la chiave in minuscolo
+                            # Es: se cerchiamo BVP e nel db è "bvp": "-21.19"
+                            target_key = s.lower()
+                            valore_trovato = v_raw.get(target_key)
+                            
+                            if valore_trovato is None: # Se non lo trova minuscolo, prova il primo che capita
+                                valore_trovato = next(iter(v_raw.values()), None)
+                            
+                            try:
+                                if valore_trovato is not None:
+                                    vals.append(float(valore_trovato))
+                            except: continue
 
                 if vals:
                     stats_results[s] = {
@@ -385,23 +394,21 @@ def statistics_page():
                 else:
                     stats_results[s] = None
 
-            # --- SALVATAGGIO SU FIRESTORE ---
-            # Salviamo solo se abbiamo trovato almeno un dato
+            # --- SALVATAGGIO ---
             if any(v is not None for v in stats_results.values()):
                 doc_id = f"{selected_user}_{selected_sess}"
                 db.collection('statistiche').document(doc_id).set({
                     'user': selected_user,
                     'session': selected_sess,
                     'last_update': datetime.now(),
-                    'stats': stats_results,
-                    'range_analisi': {'inizio': data_inizio_filtro, 'fine': ultima_data_db}
+                    'stats': stats_results
                 })
         else:
-            print(f"DEBUG: Nessun dato trovato per Utente {selected_user} Sessione {selected_sess}")
-            for s in sensori: stats_results[s] = None
+            # Se entra qui, significa che Utente + Sessione non esistono nel DB
+            for s in sensori_nomi: stats_results[s] = None
 
     except Exception as e:
-        print(f"ERRORE: {e}")
+        print(f"ERRORE DURANTE IL CALCOLO: {e}")
 
     return render_template_string(HTML_STATS_TEMPLATE, 
                                   stats=stats_results, 
