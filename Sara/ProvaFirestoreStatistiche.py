@@ -403,7 +403,7 @@ def statistics_page():
         db.collection('statistiche').document(doc_id).set({
             'user': selected_user,
             'session': selected_sess,
-            'last_update': datetime.now(),
+            'last_update': datetime.now(timezone(timedelta(hours=2))),
             'stats': stats_results
         })
 
