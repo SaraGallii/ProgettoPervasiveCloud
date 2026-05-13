@@ -326,27 +326,22 @@ def statistics_page():
     sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
     
     try:
-        # --- LOGICA DI ANCORAGGIO TEMPORALE (IGNORA IL 2026) ---
-        # Troviamo l'ultimo timestamp REALE nel DB per questo utente e sessione
+        # Usiamo il sensore ACC come riferimento per trovare l'ultima data disponibile
+        # Questo ci permette di usare l'indice composito che hai già creato (user, session, sensor, timestamp)
         last_record_query = db.collection('dati_sensori')\
                                 .where('user', '==', str(selected_user))\
                                 .where('session', '==', str(selected_sess))\
+                                .where('sensor', '==', 'ACC')\
                                 .order_by('timestamp', direction=firestore.Query.DESCENDING)\
                                 .limit(1).get()
         
         if last_record_query:
             ultima_data_db = last_record_query[0].to_dict().get('timestamp')
-            # Calcoliamo il range di 7 giorni basandoci sulla data del 2021 trovata
             data_inizio_filtro = ultima_data_db - timedelta(days=7)
             
-            print(f"DEBUG: Trovata data ancora nel 2021: {ultima_data_db}")
-        else:
-            # Se non ci sono dati per questo utente/sessione, evitiamo la query dei sensori
-            ultima_data_db = None
-            data_inizio_filtro = None
-
-        # 2. QUERY SUI SENSORI BASATA SULLA "SETTIMANA REALE"
-        if ultima_data_db:
+            print(f"DEBUG: Trovato ultimo dato ACC il: {ultima_data_db}")
+            
+            # ORA ESEGUIAMO IL CICLO SUI SENSORI
             for s in sensori:
                 query = db.collection('dati_sensori')\
                           .where('user', '==', str(selected_user))\
