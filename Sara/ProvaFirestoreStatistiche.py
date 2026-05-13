@@ -308,7 +308,9 @@ def dashboard():
         print(f"ERRORE FATALE: {e}")
         return f"<h1>Errore di caricamento</h1><p>{e}</p><a href='/logout'>Torna al login</a>"
 
-@app.route('/statistics_admin')
+from dateutil import parser # Assicurati che sia importato in alto
+
+@app.route('/statistics_admin') #proviamo così
 def statistics_admin():
     if 'user' not in session or session.get('tipo') != 'admin':
         return redirect(url_for('login'))
@@ -326,7 +328,6 @@ def statistics_admin():
         for sess in ['01', '02', '03']:
             report_finale[sess] = []
             
-            # Prendo l'ultimo record per trovare la data del 2021
             query_last = db.collection('dati_sensori')\
                            .where('user', '==', selected_user)\
                            .where('session', '==', sess)\
@@ -336,16 +337,26 @@ def statistics_admin():
             if not query_last:
                 continue
                 
-            # data_fine diventa il nostro punto di riferimento nel 2021
-            data_fine = query_last[0].to_dict()['timestamp']
+            raw_ts = query_last[0].to_dict()['timestamp']
             
-            # Normalizziamo il fuso orario e azzeriamo i microsecondi per sicurezza
-            if data_fine.tzinfo is None:
-                data_fine = data_fine.replace(tzinfo=pytz.UTC)
-            data_fine = data_fine.replace(microsecond=0)
-            
-            # Sottraiamo 7 giorni (più 1 ora di margine per sicurezza)
-            data_inizio = data_fine - timedelta(days=7, hours=1)
+            # --- SUPER CONVERSIONE DATA ---
+            try:
+                if isinstance(raw_ts, str):
+                    # Se è una stringa (es. "8 settembre 2021"), la trasformiamo in oggetto data
+                    data_fine = parser.parse(raw_ts, fuzzy=True)
+                else:
+                    data_fine = raw_ts
+
+                # Ora che siamo SICURI che sia una data, gestiamo il fuso orario
+                if data_fine.tzinfo is None:
+                    data_fine = data_fine.replace(tzinfo=pytz.UTC)
+                
+                data_fine = data_fine.replace(microsecond=0)
+                data_inizio = data_fine - timedelta(days=7)
+            except Exception as e:
+                print(f"Errore critico data: {e}")
+                continue
+            # ------------------------------
 
             sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
             for s in sensori:
@@ -362,13 +373,12 @@ def statistics_admin():
                     v_raw = d.to_dict().get('valori', {})
                     try:
                         if s == "ACC":
-                            # Cerchiamo le chiavi ax, ay, az o x, y, z
                             ax = float(v_raw.get('ax', v_raw.get('x', 0)))
                             ay = float(v_raw.get('ay', v_raw.get('y', 0)))
                             az = float(v_raw.get('az', v_raw.get('z', 0)))
                             valori.append(math.sqrt(ax**2 + ay**2 + az**2))
                         else:
-                            # Prende il primo valore disponibile (es. eda, hr, temp)
+                            # Estrae il valore (es. "0.663956") e lo converte in float
                             val = next(iter(v_raw.values()))
                             valori.append(float(val))
                     except: continue
@@ -378,7 +388,7 @@ def statistics_admin():
                     s_min = round(min(valori), 2)
                     s_max = round(max(valori), 2)
 
-                    # Salvataggio
+                    # Salvataggio su Firestore
                     stat_id = f"{selected_user}_{sess}_{s}"
                     db.collection('statistiche_settimanali').document(stat_id).set({
                         'user': selected_user,
@@ -387,8 +397,8 @@ def statistics_admin():
                         'media': s_media,
                         'min': s_min,
                         'max': s_max,
-                        'data_creazione_report': datetime.now(pytz.UTC), # Questa è solo la data di oggi
-                        'periodo_dati_2021': f"{data_inizio.strftime('%d/%m/%Y')} - {data_fine.strftime('%d/%m/%Y')}"
+                        'data_calcolo': datetime.now(pytz.UTC), # Solo per log
+                        'periodo_2021': f"{data_inizio.strftime('%d/%m/%Y')} - {data_fine.strftime('%d/%m/%Y')}"
                     })
 
                     report_finale[sess].append({
@@ -396,9 +406,6 @@ def statistics_admin():
                     })
 
     return render_template_string(HTML_STATS_SIMPLE, utenti=lista_utenti, report=report_finale, sel_u=selected_user)
-
-
-
 
 HTML_STATS_SIMPLE = '''
 <!DOCTYPE html>
