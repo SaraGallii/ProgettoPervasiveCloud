@@ -133,7 +133,7 @@ def dashboard():
                           .where('user', '==', selected_user)\
                           .where('sensor', '==', s)\
                           .where('session', '==', selected_sess)\
-                          .order_by('data_ricezione', direction=firestore.Query.DESCENDING)\
+                          .order_by('timestamp', direction=firestore.Query.DESCENDING)\
                           .limit(40) # Limitiamo i punti per caricare velocemente
                 
                 results = [d.to_dict() for d in query.stream()]
