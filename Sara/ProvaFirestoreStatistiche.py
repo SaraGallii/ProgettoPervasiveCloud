@@ -310,24 +310,30 @@ def dashboard():
 
 from dateutil import parser # Assicurati che sia importato in alto
 
-@app.route('/statistics_admin') #proviamo così
+@app.route('/statistics_admin')
 def statistics_admin():
     if 'user' not in session or session.get('tipo') != 'admin':
         return redirect(url_for('login'))
 
-    selected_user = request.args.get('u')
-    docs_u = db.collection('dati_sensori').select(['user']).limit(500).stream()
+    # 1. Recupero lista utenti unica
+    docs_u = db.collection('dati_sensori').select(['user']).limit(1000).stream()
     lista_utenti = sorted(list(set([d.to_dict().get('user') for d in docs_u if d.to_dict().get('user')])))
     
+    selected_user = request.args.get('u')
     if not selected_user and lista_utenti:
         selected_user = lista_utenti[0]
 
     report_finale = {} 
 
     if selected_user:
-        for sess in ['01', '02', '03']:
+        # 2. Recupero dinamico delle sessioni dell'utente (per non saltarne nessuna)
+        docs_s = db.collection('dati_sensori').where('user', '==', selected_user).select(['session']).stream()
+        elenco_sessioni = sorted(list(set([d.to_dict().get('session') for d in docs_s if d.to_dict().get('session')])))
+
+        for sess in elenco_sessioni:
             report_finale[sess] = []
             
+            # Cerchiamo l'ultimo timestamp per definire la finestra di 7 giorni
             query_last = db.collection('dati_sensori')\
                            .where('user', '==', selected_user)\
                            .where('session', '==', sess)\
@@ -337,58 +343,70 @@ def statistics_admin():
             if not query_last:
                 continue
                 
-            raw_ts = query_last[0].to_dict()['timestamp']
+            raw_ts = query_last[0].to_dict().get('timestamp')
             
-            # --- SUPER CONVERSIONE DATA ---
             try:
+                # Gestione robusta della data
                 if isinstance(raw_ts, str):
-                    # Se è una stringa (es. "8 settembre 2021"), la trasformiamo in oggetto data
                     data_fine = parser.parse(raw_ts, fuzzy=True)
                 else:
                     data_fine = raw_ts
 
-                # Ora che siamo SICURI che sia una data, gestiamo il fuso orario
                 if data_fine.tzinfo is None:
                     data_fine = data_fine.replace(tzinfo=pytz.UTC)
                 
                 data_fine = data_fine.replace(microsecond=0)
                 data_inizio = data_fine - timedelta(days=7)
             except Exception as e:
-                print(f"Errore critico data: {e}")
+                print(f"Errore data per utente {selected_user}: {e}")
                 continue
-            # ------------------------------
 
-            sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
-            for s in sensori:
-                docs = db.collection('dati_sensori')\
-                         .where('user', '==', selected_user)\
-                         .where('session', '==', sess)\
-                         .where('sensor', '==', s)\
-                         .where('timestamp', '>=', data_inizio)\
-                         .where('timestamp', '<=', data_fine)\
-                         .stream()
+            sensori_nomi = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
+            
+            for s in sensori_nomi:
+                # Query per il singolo sensore nell'intervallo stabilito
+                docs_sensor = db.collection('dati_sensori')\
+                                 .where('user', '==', selected_user)\
+                                 .where('session', '==', sess)\
+                                 .where('sensor', '==', s)\
+                                 .where('timestamp', '>=', data_inizio)\
+                                 .where('timestamp', '<=', data_fine)\
+                                 .stream()
 
                 valori = []
-                for d in docs:
+                for d in docs_sensor:
                     v_raw = d.to_dict().get('valori', {})
+                    
+                    # Se i valori sono salvati come stringa JSON (capita con alcuni upload)
+                    if isinstance(v_raw, str):
+                        try: v_raw = json.loads(v_raw.replace("'", '"'))
+                        except: continue
+
                     try:
                         if s == "ACC":
-                            ax = float(v_raw.get('ax', v_raw.get('x', 0)))
-                            ay = float(v_raw.get('ay', v_raw.get('y', 0)))
-                            az = float(v_raw.get('az', v_raw.get('z', 0)))
+                            # Cerca ax, ay, az sia minuscoli che maiuscoli
+                            ax = float(v_raw.get('ax') or v_raw.get('AX') or v_raw.get('x', 0))
+                            ay = float(v_raw.get('ay') or v_raw.get('AY') or v_raw.get('y', 0))
+                            az = float(v_raw.get('az') or v_raw.get('AZ') or v_raw.get('z', 0))
                             valori.append(math.sqrt(ax**2 + ay**2 + az**2))
                         else:
-                            # Estrae il valore (es. "0.663956") e lo converte in float
-                            val = next(iter(v_raw.values()))
-                            valori.append(float(val))
-                    except: continue
+                            # Cerca la chiave del sensore (es. "HR" o "hr")
+                            # Se non la trova, prende il primo valore disponibile nel dizionario
+                            val_found = v_raw.get(s) or v_raw.get(s.lower())
+                            if val_found is None and v_raw:
+                                val_found = next(iter(v_raw.values()))
+                            
+                            if val_found is not None:
+                                valori.append(float(val_found))
+                    except:
+                        continue
 
                 if valori:
                     s_media = round(statistics.mean(valori), 2)
                     s_min = round(min(valori), 2)
                     s_max = round(max(valori), 2)
 
-                    # Salvataggio su Firestore
+                    # Salvataggio/Aggiornamento statistiche
                     stat_id = f"{selected_user}_{sess}_{s}"
                     db.collection('statistiche_settimanali').document(stat_id).set({
                         'user': selected_user,
@@ -397,12 +415,15 @@ def statistics_admin():
                         'media': s_media,
                         'min': s_min,
                         'max': s_max,
-                        'data_calcolo': datetime.now(pytz.UTC), # Solo per log
-                        'periodo_2021': f"{data_inizio.strftime('%d/%m/%Y')} - {data_fine.strftime('%d/%m/%Y')}"
+                        'data_elaborazione': datetime.now(pytz.UTC),
+                        'intervallo_dati': f"{data_inizio.strftime('%d/%m/%Y')} - {data_fine.strftime('%d/%m/%Y')}"
                     })
 
                     report_finale[sess].append({
-                        'sensor': s, 'media': s_media, 'min': s_min, 'max': s_max
+                        'sensor': s, 
+                        'media': s_media, 
+                        'min': s_min, 
+                        'max': s_max
                     })
 
     return render_template_string(HTML_STATS_SIMPLE, utenti=lista_utenti, report=report_finale, sel_u=selected_user)
@@ -451,7 +472,7 @@ HTML_STATS_SIMPLE = '''
                 <select name="u" id="u" onchange="this.form.submit()">
                     <option value="" disabled {% if not sel_u %}selected{% endif %}>Scegli utente...</option>
                     {% for u in utenti %}
-                        <option value="{{ u }}" {% if u == sel_u %}selected{% endif %}>Paziente {{ u }}</option>
+                        <option value="{{ u }}" {% if u == sel_u %}selected{% endif %}>Utente {{ u }}</option>
                     {% endfor %}
                 </select>
             </form>
