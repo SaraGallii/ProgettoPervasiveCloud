@@ -312,33 +312,25 @@ def statistics_page():
     if 'user' not in session:
         return redirect(url_for('login'))
 
-    # 1. Recupero parametri per i menu a tendina
+    # 1. Recupero parametri (User e Session)
     docs_u = db.collection('dati_sensori').select(['user']).limit(200).stream()
     lista_utenti = sorted(list(set([d.to_dict().get('user') for d in docs_u if d.to_dict().get('user')])))
     
     docs_s = db.collection('dati_sensori').select(['session']).limit(200).stream()
     lista_sessioni = sorted(list(set([d.to_dict().get('session') for d in docs_s if d.to_dict().get('session')])))
 
-    # --- INIZIO INTEGRAZIONE LOGICA STRINGHE 03/02 ---
-    # Recupero il valore dal parametro URL (es: ?u=3)
     u_raw = request.args.get('u', "")
-    if u_raw:
-        # Forza a 2 caratteri: "3" -> "03", "10" -> "10"
-        selected_user = str(u_raw).zfill(2)
-    else:
-        selected_user = lista_utenti[0] if lista_utenti else ""
-
-    # Applichiamo lo stesso per la sessione (es: "2" -> "02")
+    selected_user = str(u_raw).zfill(2) if u_raw else (lista_utenti[0] if lista_utenti else "")
+    
     s_raw = request.args.get('s', "01")
     selected_sess = str(s_raw).zfill(2)
-    # --- FINE INTEGRAZIONE ---
 
     stats_results = {}
     sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
+    data_salvataggio_avvenuto = False # Flag per il salvataggio
     
     try:
-        # Eseguiamo la query con selected_user e selected_sess formattati correttamente
-        # Usiamo ACC come riferimento temporale per il 2021
+        # Cerchiamo l'ultimo record per definire la finestra temporale (Agosto 2021)
         last_record_query = db.collection('dati_sensori')\
                                 .where('user', '==', selected_user)\
                                 .where('session', '==', selected_sess)\
@@ -347,10 +339,11 @@ def statistics_page():
                                 .limit(1).get()
         
         if last_record_query:
-            ultima_data_db = last_record_query[0].to_dict().get('timestamp') # Data del 24/08/2021
+            ultima_data_db = last_record_query[0].to_dict().get('timestamp')
+            # Calcolo i 7 giorni precedenti
             data_inizio_filtro = ultima_data_db - timedelta(days=7)
             
-            print(f"DEBUG: Cerco dati tra {data_inizio_filtro} e {ultima_data_db} per User {selected_user}")
+            print(f"DEBUG: Finestra temporale: {data_inizio_filtro} -> {ultima_data_db}")
             
             for s in sensori:
                 query = db.collection('dati_sensori')\
@@ -364,15 +357,15 @@ def statistics_page():
                 vals = []
                 for d in query:
                     row = d.to_dict()
-                    v_raw = row.get('valori', {}) # Questo è una mappa con stringhe
+                    v_raw = row.get('valori', {})
                     
+                    # Gestione stringhe JSON o Mappe
                     if isinstance(v_raw, str):
                         try: v_raw = json.loads(v_raw.replace("'", '"'))
                         except: continue
 
                     try:
                         if s == "ACC":
-                            # Conversione forzata da stringa a float per i calcoli
                             ax = float(v_raw.get('ax', 0))
                             ay = float(v_raw.get('ay', 0))
                             az = float(v_raw.get('az', 0))
@@ -394,23 +387,35 @@ def statistics_page():
                     }
                 else:
                     stats_results[s] = None
+            
+            # --- CORREZIONE LOGICA SALVATAGGIO ---
+            # Controlliamo se abbiamo almeno un sensore con dati validi
+            ha_dati_reali = any(res is not None for res in stats_results.values())
+            
+            if ha_dati_reali:
+                doc_id = f"{selected_user}_{selected_sess}"
+                db.collection('statistiche').document(doc_id).set({
+                    'user': selected_user,
+                    'session': selected_sess,
+                    'last_update': datetime.now(),
+                    'stats': stats_results,
+                    'periodo_riferimento': {
+                        'inizio': data_inizio_filtro,
+                        'fine': ultima_data_db
+                    }
+                })
+                data_salvataggio_avvenuto = True
+                print(f"DEBUG: Salvataggio riuscito per {doc_id}")
+            else:
+                print("DEBUG: Nessun dato trovato nei 7 giorni selezionati.")
+
         else:
-            print(f"DEBUG: Nessun dato per User {selected_user} Session {selected_sess}")
+            print(f"DEBUG: Nessun record ACC trovato per User {selected_user} Session {selected_sess}")
             for s in sensori: stats_results[s] = None
 
     except Exception as e:
         print(f"ERRORE CRITICO: {e}")
-        for s in sensori: stats_results[s] = None
-
-    # Salvataggio su Firestore nella raccolta 'statistiche'
-    if any(stats_results.values()):
-        doc_id = f"{selected_user}_{selected_sess}"
-        db.collection('statistiche').document(doc_id).set({
-            'user': selected_user,
-            'session': selected_sess,
-            'last_update': datetime.now(),
-            'stats': stats_results
-        })
+        # Se l'errore riguarda gli indici, apparirà qui nel log
 
     aggiornato_il = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
     return render_template_string(HTML_STATS_TEMPLATE, 
@@ -419,7 +424,8 @@ def statistics_page():
                                   sessioni=lista_sessioni,
                                   selected_u=selected_user, 
                                   selected_s=selected_sess,
-                                  last_calc=aggiornato_il)
+                                  last_calc=aggiornato_il,
+                                  salvato=data_salvataggio_avvenuto)
 
 HTML_STATS_TEMPLATE = '''
 <!DOCTYPE html>
