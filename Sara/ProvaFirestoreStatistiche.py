@@ -307,14 +307,13 @@ def dashboard():
     except Exception as e:
         print(f"ERRORE FATALE: {e}")
         return f"<h1>Errore di caricamento</h1><p>{e}</p><a href='/logout'>Torna al login</a>"
+
 @app.route('/statistics_admin')
 def statistics_admin():
     if 'user' not in session or session.get('tipo') != 'admin':
         return redirect(url_for('login'))
 
     selected_user = request.args.get('u')
-    
-    # 1. Recupero lista utenti univoci
     docs_u = db.collection('dati_sensori').select(['user']).limit(500).stream()
     lista_utenti = sorted(list(set([d.to_dict().get('user') for d in docs_u if d.to_dict().get('user')])))
     
@@ -327,7 +326,7 @@ def statistics_admin():
         for sess in ['01', '02', '03']:
             report_finale[sess] = []
             
-            # 2. Trova l'ultimo timestamp disponibile per "agganciare" il dataset al 2021
+            # Prendo l'ultimo record per trovare la data del 2021
             query_last = db.collection('dati_sensori')\
                            .where('user', '==', selected_user)\
                            .where('session', '==', sess)\
@@ -337,29 +336,19 @@ def statistics_admin():
             if not query_last:
                 continue
                 
-            raw_timestamp = query_last[0].to_dict()['timestamp']
+            # data_fine diventa il nostro punto di riferimento nel 2021
+            data_fine = query_last[0].to_dict()['timestamp']
             
-            # Gestione conversione data (Stringa vs Timestamp) e Fuso Orario
-            try:
-                if isinstance(raw_timestamp, str):
-                    data_fine = parser.parse(raw_timestamp)
-                else:
-                    data_fine = raw_timestamp
-                
-                # Sincronizzazione fusi orari (essenziale per il confronto >= <=)
-                if data_fine.tzinfo is None:
-                    data_fine = data_fine.replace(tzinfo=pytz.UTC)
-                
-                # Definiamo la finestra di 7 giorni nel passato (rispetto al dataset)
-                data_inizio = data_fine - timedelta(days=7)
-                
-            except Exception as e:
-                print(f"Errore data utente {selected_user}: {e}")
-                continue
+            # Normalizziamo il fuso orario e azzeriamo i microsecondi per sicurezza
+            if data_fine.tzinfo is None:
+                data_fine = data_fine.replace(tzinfo=pytz.UTC)
+            data_fine = data_fine.replace(microsecond=0)
+            
+            # Sottraiamo 7 giorni (più 1 ora di margine per sicurezza)
+            data_inizio = data_fine - timedelta(days=7, hours=1)
 
             sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
             for s in sensori:
-                # 3. Query filtrata per utente, sessione, sensore e finestra temporale
                 docs = db.collection('dati_sensori')\
                          .where('user', '==', selected_user)\
                          .where('session', '==', sess)\
@@ -370,30 +359,26 @@ def statistics_admin():
 
                 valori = []
                 for d in docs:
-                    dati_doc = d.to_dict()
-                    v_raw = dati_doc.get('valori', {}) # Accede al campo 'valori' che è un dizionario
-                    
+                    v_raw = d.to_dict().get('valori', {})
                     try:
                         if s == "ACC":
-                            # Formula magnitudo per accelerometro
+                            # Cerchiamo le chiavi ax, ay, az o x, y, z
                             ax = float(v_raw.get('ax', v_raw.get('x', 0)))
                             ay = float(v_raw.get('ay', v_raw.get('y', 0)))
                             az = float(v_raw.get('az', v_raw.get('z', 0)))
                             valori.append(math.sqrt(ax**2 + ay**2 + az**2))
                         else:
-                            # Per gli altri sensori prende il primo valore numerico trovato nel dizionario
-                            val_list = [float(v) for v in v_raw.values() if str(v).replace('.','',1).isdigit()]
-                            if val_list:
-                                valori.append(val_list[0])
+                            # Prende il primo valore disponibile (es. eda, hr, temp)
+                            val = next(iter(v_raw.values()))
+                            valori.append(float(val))
                     except: continue
 
                 if valori:
-                    # 4. Calcolo statistiche
                     s_media = round(statistics.mean(valori), 2)
                     s_min = round(min(valori), 2)
                     s_max = round(max(valori), 2)
 
-                    # 5. Salvataggio persistente su nuova tabella 'statistiche_settimanali'
+                    # Salvataggio
                     stat_id = f"{selected_user}_{sess}_{s}"
                     db.collection('statistiche_settimanali').document(stat_id).set({
                         'user': selected_user,
@@ -402,8 +387,8 @@ def statistics_admin():
                         'media': s_media,
                         'min': s_min,
                         'max': s_max,
-                        'data_calcolo': datetime.now(pytz.UTC),
-                        'intervallo_temporale': f"{data_inizio.strftime('%d/%m/%Y')} - {data_fine.strftime('%d/%m/%Y')}"
+                        'data_creazione_report': datetime.now(pytz.UTC), # Questa è solo la data di oggi
+                        'periodo_dati_2021': f"{data_inizio.strftime('%d/%m/%Y')} - {data_fine.strftime('%d/%m/%Y')}"
                     })
 
                     report_finale[sess].append({
