@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify, session, redirect, url_for, render_template_string
-from datetime import datetime, timedelta
+from datetime import datetime,timezone, timedelta
 import json
 import math
 import statistics
@@ -33,7 +33,7 @@ def receive_data():
             'sensor': data.get('sensor'),
             'timestamp': ts_datetime,      # Ora è un vero Timestamp
             'valori': valori_data,         # Salvato come MAP (non stringa!), meglio per i calcoli
-            'data_ricezione': datetime.now()
+            'data_ricezione': datetime.now(timezone(timedelta(hours=2)))
         })
         return jsonify({"status": "success"}), 200
     except Exception as e:
