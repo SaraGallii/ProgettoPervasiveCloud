@@ -326,8 +326,7 @@ def statistics_page():
     sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
     
     try:
-        # Usiamo il sensore ACC come riferimento per trovare l'ultima data disponibile
-        # Questo ci permette di usare l'indice composito che hai già creato (user, session, sensor, timestamp)
+        # Usiamo il sensore ACC e i parametri stringa per trovare l'ultimo dato del 2021
         last_record_query = db.collection('dati_sensori')\
                                 .where('user', '==', str(selected_user))\
                                 .where('session', '==', str(selected_sess))\
@@ -339,9 +338,8 @@ def statistics_page():
             ultima_data_db = last_record_query[0].to_dict().get('timestamp')
             data_inizio_filtro = ultima_data_db - timedelta(days=7)
             
-            print(f"DEBUG: Trovato ultimo dato ACC il: {ultima_data_db}")
+            print(f"DEBUG: Trovata ancora temporale al {ultima_data_db}")
             
-            # ORA ESEGUIAMO IL CICLO SUI SENSORI
             for s in sensori:
                 query = db.collection('dati_sensori')\
                           .where('user', '==', str(selected_user))\
@@ -354,26 +352,29 @@ def statistics_page():
                 vals = []
                 for d in query:
                     row = d.to_dict()
-                    v_raw = row.get('valori', '{}')
+                    v_raw = row.get('valori', {})
                     
-                    # Gestione robusta del JSON/Dizionario
+                    # Gestione robusta: se valori è una stringa JSON, la convertiamo in dizionario
                     if isinstance(v_raw, str):
-                        v_dict = json.loads(v_raw.replace("'", '"'))
-                    else:
-                        v_dict = v_raw
-                    
+                        try:
+                            v_raw = json.loads(v_raw.replace("'", '"'))
+                        except: continue
+
                     try:
+                        # CONVERSIONE STRINGA -> FLOAT
                         if s == "ACC":
-                            ax = float(v_dict.get('ax', v_dict.get('x', 0)))
-                            ay = float(v_dict.get('ay', v_dict.get('y', 0)))
-                            az = float(v_dict.get('az', v_dict.get('z', 0)))
+                            # Estraiamo le stringhe ax, ay, az e convertiamo in float per il calcolo geometrico
+                            ax = float(v_raw.get('ax', v_raw.get('x', 0)))
+                            ay = float(v_raw.get('ay', v_raw.get('y', 0)))
+                            az = float(v_raw.get('az', v_raw.get('z', 0)))
                             vals.append(math.sqrt(ax**2 + ay**2 + az**2))
                         else:
-                            # Prende il primo valore numerico disponibile nella mappa
-                            valore_estratto = next((float(v) for v in v_dict.values() if isinstance(v, (int, float, str))), 0.0)
-                            vals.append(valore_estratto)
-                    except (ValueError, StopIteration):
-                        continue
+                            # Per gli altri sensori, prendiamo il primo valore della mappa e forziamo float()
+                            if v_raw:
+                                valore_stringa = next(iter(v_raw.values()))
+                                vals.append(float(valore_stringa))
+                    except (ValueError, TypeError, StopIteration):
+                        continue # Salta il record se la stringa non è convertibile in numero
 
                 if vals:
                     stats_results[s] = {
@@ -388,16 +389,15 @@ def statistics_page():
                     stats_results[s] = None
         else:
             for s in sensori: stats_results[s] = None
+            print("DEBUG: Nessun documento trovato per questa combinazione.")
 
     except Exception as e:
         print(f"ERRORE CRITICO: {e}")
-        # Se ricevi un errore di 'Index', clicca il link che Firestore genera nel terminale
         for s in sensori: stats_results[s] = None
 
-    # 3. Aggiornamento UI e salvataggio
     aggiornato_il = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
     
-    # Salvataggio asincrono dei risultati (opzionale)
+    # Salvataggio risultati calcolati
     if any(stats_results.values()):
         doc_id = f"{selected_user}_{selected_sess}"
         db.collection('statistiche').document(doc_id).set({
