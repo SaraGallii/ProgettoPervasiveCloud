@@ -409,63 +409,85 @@ def statistics_admin():
 
 HTML_STATS_SIMPLE = '''
 <!DOCTYPE html>
-<html>
+<html lang="it">
 <head>
-    <title>Statistiche Utenti</title>
+    <meta charset="UTF-8">
+    <title>Admin - Statistiche Sensori</title>
     <style>
-        body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #f8f9fa; padding: 20px; }
-        .container { max-width: 900px; margin: auto; }
-        .card { background: white; border-radius: 10px; padding: 20px; margin-bottom: 25px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
-        h2 { color: #1a73e8; margin-top: 0; }
-        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
-        th, td { padding: 12px; border-bottom: 1px solid #eee; text-align: center; }
-        th { background: #1a73e8; color: white; border: none; }
-        .sensor-label { font-weight: bold; text-align: left; color: #333; }
-        .btn-back { display: inline-block; margin-top: 20px; text-decoration: none; color: #1a73e8; font-weight: bold; }
+        body { font-family: 'Inter', -apple-system, sans-serif; background: #f0f2f5; color: #1c1e21; padding: 40px 20px; margin: 0; }
+        .container { max-width: 1000px; margin: auto; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
+        .user-selector { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); margin-bottom: 30px; }
+        select { padding: 10px 15px; border-radius: 8px; border: 1px solid #ddd; font-size: 16px; min-width: 200px; }
+        
+        .session-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+        .card { background: white; border-radius: 16px; padding: 25px; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); border-top: 5px solid #1a73e8; }
+        .card h2 { margin-top: 0; color: #1a73e8; font-size: 1.2rem; border-bottom: 1px solid #eee; padding-bottom: 10px; }
+        
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th { text-align: left; font-size: 12px; text-transform: uppercase; color: #65676b; padding: 10px 5px; }
+        td { padding: 12px 5px; border-bottom: 1px solid #f0f2f5; font-size: 15px; }
+        
+        .sensor-name { font-weight: 600; color: #4b4b4b; }
+        .val-media { font-weight: bold; color: #1a73e8; }
+        .val-min { color: #2ecc71; font-size: 0.9em; }
+        .val-max { color: #e74c3c; font-size: 0.9em; }
+        
+        .empty-state { text-align: center; color: #8e8e8e; padding: 20px; font-style: italic; }
+        .btn-back { display: inline-block; margin-top: 30px; text-decoration: none; color: #65676b; transition: 0.2s; }
+        .btn-back:hover { color: #1a73e8; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>Report Settimanale Parametri</h1>
-        
-        <form method="get" style="margin-bottom: 30px;">
-            <label><b>Seleziona Utente:</b> </label>
-            <select name="u" onchange="this.form.submit()" style="padding: 8px; border-radius: 5px;">
-                {% for u in utenti %}
-                <option value="{{ u }}" {% if u == sel_u %}selected{% endif %}>Utente {{ u }}</option>
-                {% endfor %}
-            </select>
-        </form>
-
-        {% for sess, data_list in report.items() %}
-        <div class="card">
-            <h2>Sessione {{ sess }}</h2>
-            {% if data_list %}
-            <table>
-                <thead>
-                    <tr>
-                        <th style="text-align:left;">Sensore</th>
-                        <th>Media</th>
-                        <th>Minimo</th>
-                        <th>Massimo</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for s in data_list %}
-                    <tr>
-                        <td class="sensor-label">{{ s.sensor }}</td>
-                        <td>{{ s.media }}</td>
-                        <td style="color: #28a745;">{{ s.min }}</td>
-                        <td style="color: #dc3545;">{{ s.max }}</td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
-            {% else %}
-            <p style="color: #666;">Nessun dato disponibile per questa sessione nel periodo selezionato.</p>
-            {% endif %}
+        <div class="header">
+            <h1>Statistiche Settimanali</h1>
+            <span style="background: #1a73e8; color: white; padding: 5px 12px; border-radius: 20px; font-size: 14px;">Admin Mode</span>
         </div>
-        {% endfor %}
+
+        <div class="user-selector">
+            <form method="get">
+                <label for="u" style="display: block; margin-bottom: 10px; font-weight: bold;">Seleziona un utente per visualizzare i dati:</label>
+                <select name="u" id="u" onchange="this.form.submit()">
+                    <option value="" disabled {% if not sel_u %}selected{% endif %}>Scegli utente...</option>
+                    {% for u in utenti %}
+                        <option value="{{ u }}" {% if u == sel_u %}selected{% endif %}>Paziente {{ u }}</option>
+                    {% endfor %}
+                </select>
+            </form>
+        </div>
+
+        <div class="session-grid">
+            {% for sess, data_list in report.items() %}
+            <div class="card">
+                <h2>Sessione {{ sess }}</h2>
+                {% if data_list %}
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Sensore</th>
+                            <th>Media</th>
+                            <th>Min</th>
+                            <th>Max</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for s in data_list %}
+                        <tr>
+                            <td class="sensor-name">{{ s.sensor }}</td>
+                            <td class="val-media">{{ s.media }}</td>
+                            <td class="val-min">{{ s.min }}</td>
+                            <td class="val-max">{{ s.max }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+                {% else %}
+                <div class="empty-state">Nessuna rilevazione trovata</div>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </div>
 
         <a href="/dashboard_admin" class="btn-back">← Torna alla Dashboard</a>
     </div>
