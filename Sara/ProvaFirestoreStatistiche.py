@@ -326,7 +326,7 @@ def statistics_page():
     sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
     
     # Filtro 7 giorni
-    una_settimana_fa = datetime.now() - timedelta(days=7)
+    una_settimana_fa = datetime.now() - timedelta(days=2000)
 
     # 2. Query con filtro temporale
     for s in sensori:
