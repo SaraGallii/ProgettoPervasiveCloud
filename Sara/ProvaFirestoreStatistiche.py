@@ -20,7 +20,7 @@ def receive_data():
     try:
         raw_ts = data.get('timestamp')
         ts_seconds = float(raw_ts) / 1000
-        ts_formattato = datetime.fromtimestamp(ts_seconds).strftime('%H:%M:%S')
+        ts_datetime = datetime.fromtimestamp(float(data.get('timestamp')) / 1000)
         
         # Salvataggio su Firestore
         doc_ref = db.collection('dati_sensori').document()
@@ -28,7 +28,7 @@ def receive_data():
             'user': data.get('user'),
             'session': data.get('session'),
             'sensor': data.get('sensor'),
-            'timestamp': ts_formattato,
+            'timestamp': ts_datetime,
             'valori': json.dumps(data.get('data')),
             'data_ricezione': datetime.now()
         })
@@ -325,7 +325,7 @@ def statistics_page():
                       .where('user', '==', selected_user)\
                       .where('session', '==', selected_sess)\
                       .where('sensor', '==', s)\
-                      .where('data_ricezione', '>=', una_settimana_fa)\
+                      .where('timestamp', '>=', una_settimana_fa)\
                       .stream()
             
             vals = []
