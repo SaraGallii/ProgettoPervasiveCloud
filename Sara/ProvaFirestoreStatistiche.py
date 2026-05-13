@@ -312,7 +312,7 @@ def statistics_page():
     if 'user' not in session:
         return redirect(url_for('login'))
 
-    # 1. Recupero parametri
+    # 1. Recupero parametri per i menu a tendina
     docs_u = db.collection('dati_sensori').select(['user']).limit(200).stream()
     lista_utenti = sorted(list(set([d.to_dict().get('user') for d in docs_u if d.to_dict().get('user')])))
     
@@ -325,76 +325,84 @@ def statistics_page():
     stats_results = {}
     sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
     
-    # Filtro 7 giorni
-    # Imposta una data molto lontana nel passato per "pescare" i dati del 2021
-    una_settimana_fa = datetime(2020, 1, 1)
-
-    # 2. Query con filtro temporale
-    for s in sensori:
-        try:
-            # 1. TROVA IL TIMESTAMP PIÙ RECENTE NEL DB PER QUESTO UTENTE
-            # Invece di usare datetime.now() del 2026, cerchiamo l'ultimo dato del 2021
-            last_record_query = db.collection('dati_sensori')\
-                                .where('user', '==', selected_user)\
+    try:
+        # --- LOGICA DI ANCORAGGIO TEMPORALE (IGNORA IL 2026) ---
+        # Troviamo l'ultimo timestamp REALE nel DB per questo utente e sessione
+        last_record_query = db.collection('dati_sensori')\
+                                .where('user', '==', str(selected_user))\
+                                .where('session', '==', str(selected_sess))\
                                 .order_by('timestamp', direction=firestore.Query.DESCENDING)\
                                 .limit(1).get()
+        
+        if last_record_query:
+            ultima_data_db = last_record_query[0].to_dict().get('timestamp')
+            # Calcoliamo il range di 7 giorni basandoci sulla data del 2021 trovata
+            data_inizio_filtro = ultima_data_db - timedelta(days=7)
             
-            if last_record_query:
-                ultima_data_db = last_record_query[0].to_dict().get('timestamp')
-                # 2. CALCOLA IL RANGE: dall'ultima data meno 7 giorni
-                data_inizio_filtro = ultima_data_db - timedelta(days=7)
-            else:
-                # Fallback se non ci sono dati
-                data_inizio_filtro = datetime(2000, 1, 1) 
-                ultima_data_db = "Nessun dato"
+            print(f"DEBUG: Trovata data ancora nel 2021: {ultima_data_db}")
+        else:
+            # Se non ci sono dati per questo utente/sessione, evitiamo la query dei sensori
+            ultima_data_db = None
+            data_inizio_filtro = None
 
-            # 3. ESEGUI LE QUERY SUI SENSORI
+        # 2. QUERY SUI SENSORI BASATA SULLA "SETTIMANA REALE"
+        if ultima_data_db:
             for s in sensori:
                 query = db.collection('dati_sensori')\
-                        .where('user', '==', selected_user)\
-                        .where('session', '==', selected_sess)\
-                        .where('sensor', '==', s)\
-                        .where('timestamp', '>=', data_inizio_filtro)\
-                        .where('timestamp', '<=', ultima_data_db)\
-                        .stream()
-            
-            vals = []
-            for d in query:
-                row = d.to_dict()
-                v_raw = row.get('valori', '{}')
+                          .where('user', '==', str(selected_user))\
+                          .where('session', '==', str(selected_sess))\
+                          .where('sensor', '==', s)\
+                          .where('timestamp', '>=', data_inizio_filtro)\
+                          .where('timestamp', '<=', ultima_data_db)\
+                          .stream()
                 
-                # Gestione robusta del JSON
-                if isinstance(v_raw, str):
-                    v_dict = json.loads(v_raw.replace("'", '"'))
+                vals = []
+                for d in query:
+                    row = d.to_dict()
+                    v_raw = row.get('valori', '{}')
+                    
+                    # Gestione robusta del JSON/Dizionario
+                    if isinstance(v_raw, str):
+                        v_dict = json.loads(v_raw.replace("'", '"'))
+                    else:
+                        v_dict = v_raw
+                    
+                    try:
+                        if s == "ACC":
+                            ax = float(v_dict.get('ax', v_dict.get('x', 0)))
+                            ay = float(v_dict.get('ay', v_dict.get('y', 0)))
+                            az = float(v_dict.get('az', v_dict.get('z', 0)))
+                            vals.append(math.sqrt(ax**2 + ay**2 + az**2))
+                        else:
+                            # Prende il primo valore numerico disponibile nella mappa
+                            valore_estratto = next((float(v) for v in v_dict.values() if isinstance(v, (int, float, str))), 0.0)
+                            vals.append(valore_estratto)
+                    except (ValueError, StopIteration):
+                        continue
+
+                if vals:
+                    stats_results[s] = {
+                        "media": round(statistics.mean(vals), 2),
+                        "mediana": round(statistics.median(vals), 2),
+                        "moda": round(statistics.multimode(vals)[0], 2),
+                        "max": round(max(vals), 2),
+                        "min": round(min(vals), 2),
+                        "count": len(vals)
+                    }
                 else:
-                    v_dict = v_raw
-                
-                if s == "ACC":
-                    ax = float(v_dict.get('ax', v_dict.get('x', 0)))
-                    ay = float(v_dict.get('ay', v_dict.get('y', 0)))
-                    az = float(v_dict.get('az', v_dict.get('z', 0)))
-                    vals.append(math.sqrt(ax**2 + ay**2 + az**2))
-                else:
-                    vals.append(float(next(iter(v_dict.values()))))
+                    stats_results[s] = None
+        else:
+            for s in sensori: stats_results[s] = None
 
-            if vals:
-                stats_results[s] = {
-                    "media": round(statistics.mean(vals), 2),
-                    "mediana": round(statistics.median(vals), 2),
-                    "moda": round(statistics.multimode(vals)[0], 2),
-                    "max": round(max(vals), 2),
-                    "min": round(min(vals), 2),
-                    "count": len(vals)
-                }
-            else:
-                stats_results[s] = None
+    except Exception as e:
+        print(f"ERRORE CRITICO: {e}")
+        # Se ricevi un errore di 'Index', clicca il link che Firestore genera nel terminale
+        for s in sensori: stats_results[s] = None
 
-        except Exception as e:
-            print(f"Errore query sensore {s}: {e}")
-            stats_results[s] = None
-
-    # 3. Salvataggio su Firestore (Solo se ci sono dati)
+    # 3. Aggiornamento UI e salvataggio
     aggiornato_il = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
+    
+    # Salvataggio asincrono dei risultati (opzionale)
     if any(stats_results.values()):
         doc_id = f"{selected_user}_{selected_sess}"
         db.collection('statistiche').document(doc_id).set({
