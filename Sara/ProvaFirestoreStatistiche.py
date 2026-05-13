@@ -301,79 +301,78 @@ def statistics_page():
     if 'user' not in session:
         return redirect(url_for('login'))
 
-    try:
-        # 1. Recupero parametri dai filtri
-        docs_u = db.collection('dati_sensori').select(['user']).limit(200).stream()
-        lista_utenti = sorted(list(set([d.to_dict().get('user') for d in docs_u if d.to_dict().get('user')])))
-        
-        docs_s = db.collection('dati_sensori').select(['session']).limit(200).stream()
-        lista_sessioni = sorted(list(set([d.to_dict().get('session') for d in docs_s if d.to_dict().get('session')])))
+    # 1. Recupero parametri
+    docs_u = db.collection('dati_sensori').select(['user']).limit(200).stream()
+    lista_utenti = sorted(list(set([d.to_dict().get('user') for d in docs_u if d.to_dict().get('user')])))
+    
+    docs_s = db.collection('dati_sensori').select(['session']).limit(200).stream()
+    lista_sessioni = sorted(list(set([d.to_dict().get('session') for d in docs_s if d.to_dict().get('session')])))
 
-        selected_user = request.args.get('u', lista_utenti[0] if lista_utenti else "")
-        selected_sess = request.args.get('s', lista_sessioni[0] if lista_sessioni else "01")
-    except Exception as e:
-        return f"Errore nel recupero filtri: {e}"
+    selected_user = request.args.get('u', lista_utenti[0] if lista_utenti else "")
+    selected_sess = request.args.get('s', lista_sessioni[0] if lista_sessioni else "01")
 
     stats_results = {}
     sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
+    
+    # Filtro 7 giorni
     una_settimana_fa = datetime.now() - timedelta(days=7)
 
-    # 2. Calcolo dei parametri
+    # 2. Query con filtro temporale
     for s in sensori:
         try:
+            # QUESTA QUERY RICHIEDE L'INDICE COMPOSITO
             query = db.collection('dati_sensori')\
                       .where('user', '==', selected_user)\
-                      .where('sensor', '==', s)\
                       .where('session', '==', selected_sess)\
+                      .where('sensor', '==', s)\
                       .where('data_ricezione', '>=', una_settimana_fa)\
                       .stream()
             
             vals = []
             for d in query:
-                try:
-                    row = d.to_dict()
-                    v_raw = row.get('valori', '{}')
-                    v_dict = json.loads(v_raw.replace("'", '"')) if isinstance(v_raw, str) else v_raw
-                    
-                    if s == "ACC":
-                        ax = float(v_dict.get('ax', 0))
-                        ay = float(v_dict.get('ay', 0))
-                        az = float(v_dict.get('az', 0))
-                        vals.append(round(math.sqrt(ax**2 + ay**2 + az**2), 2))
-                    else:
-                        vals.append(float(next(iter(v_dict.values()))))
-                except: continue
+                row = d.to_dict()
+                v_raw = row.get('valori', '{}')
+                
+                # Gestione robusta del JSON
+                if isinstance(v_raw, str):
+                    v_dict = json.loads(v_raw.replace("'", '"'))
+                else:
+                    v_dict = v_raw
+                
+                if s == "ACC":
+                    ax = float(v_dict.get('ax', v_dict.get('x', 0)))
+                    ay = float(v_dict.get('ay', v_dict.get('y', 0)))
+                    az = float(v_dict.get('az', v_dict.get('z', 0)))
+                    vals.append(math.sqrt(ax**2 + ay**2 + az**2))
+                else:
+                    vals.append(float(next(iter(v_dict.values()))))
 
             if vals:
-                mode_list = statistics.multimode(vals)
                 stats_results[s] = {
                     "media": round(statistics.mean(vals), 2),
                     "mediana": round(statistics.median(vals), 2),
-                    "moda": round(mode_list[0], 2),
+                    "moda": round(statistics.multimode(vals)[0], 2),
                     "max": round(max(vals), 2),
                     "min": round(min(vals), 2),
                     "count": len(vals)
                 }
             else:
                 stats_results[s] = None
+
         except Exception as e:
-            print(f"Errore sensore {s}: {e}")
+            print(f"Errore query sensore {s}: {e}")
             stats_results[s] = None
 
-    # 3. SALVATAGGIO SU FIRESTORE (Nuova collezione 'statistiche')
-    ora_attuale = datetime.now()
+    # 3. Salvataggio su Firestore (Solo se ci sono dati)
+    aggiornato_il = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
     if any(stats_results.values()):
-        try:
-            # Creiamo un ID documento univoco per utente e sessione (es: "mario_01")
-            doc_id = f"{selected_user}_{selected_sess}"
-            db.collection('statistiche').document(doc_id).set({
-                'user': selected_user,
-                'session': selected_sess,
-                'last_update': ora_attuale,
-                'stats': stats_results
-            })
-        except Exception as e:
-            print(f"Errore salvataggio statistiche: {e}")
+        doc_id = f"{selected_user}_{selected_sess}"
+        db.collection('statistiche').document(doc_id).set({
+            'user': selected_user,
+            'session': selected_sess,
+            'last_update': datetime.now(),
+            'stats': stats_results
+        })
 
     return render_template_string(HTML_STATS_TEMPLATE, 
                                   stats=stats_results, 
@@ -381,7 +380,7 @@ def statistics_page():
                                   sessioni=lista_sessioni,
                                   selected_u=selected_user, 
                                   selected_s=selected_sess,
-                                  last_calc=ora_attuale.strftime('%d/%m/%Y %H:%M:%S'))
+                                  last_calc=aggiornato_il)
 
 HTML_STATS_TEMPLATE = '''
 <!DOCTYPE html>
