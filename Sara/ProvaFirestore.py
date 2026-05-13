@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify, session, redirect, url_for, render_template_string
-from datetime import datetime
+from datetime import datetime,timezone, timedelta
 import json
 import math
 import statistics
@@ -19,18 +19,21 @@ def receive_data():
         return jsonify({"status": "error", "message": "No data"}), 400
     try:
         raw_ts = data.get('timestamp')
-        ts_seconds = float(raw_ts) / 1000
-        ts_formattato = datetime.fromtimestamp(ts_seconds).strftime('%H:%M:%S')
+        # 1. Creiamo l'oggetto data/ora corretto
+        ts_datetime = datetime.fromtimestamp(float(raw_ts) / 1000)
         
+        # 2. Prendiamo i valori (es: {"temp": 33.81})
+        valori_data = data.get('data') 
+
         # Salvataggio su Firestore
         doc_ref = db.collection('dati_sensori').document()
         doc_ref.set({
             'user': data.get('user'),
             'session': data.get('session'),
             'sensor': data.get('sensor'),
-            'timestamp': ts_formattato,
-            'valori': json.dumps(data.get('data')),
-            'data_ricezione': datetime.now()
+            'timestamp': ts_datetime,      # Ora è un vero Timestamp
+            'valori': valori_data,         # Salvato come MAP (non stringa!), meglio per i calcoli
+            'data_ricezione': datetime.now(timezone(timedelta(hours=2)))
         })
         return jsonify({"status": "success"}), 200
     except Exception as e:
@@ -133,13 +136,21 @@ def dashboard():
                           .where('user', '==', selected_user)\
                           .where('sensor', '==', s)\
                           .where('session', '==', selected_sess)\
-                          .order_by('data_ricezione', direction=firestore.Query.DESCENDING)\
+                          .order_by('timestamp', direction=firestore.Query.DESCENDING)\
                           .limit(40) # Limitiamo i punti per caricare velocemente
                 
                 results = [d.to_dict() for d in query.stream()]
                 results.reverse() # Ordine cronologico per Chart.js
                 
-                labels = [r.get('timestamp', '') for r in results]
+                labels = []
+                for r in results:
+                    ts = r.get('timestamp')
+                    if ts and hasattr(ts, 'strftime'):
+                        # Se è un oggetto datetime di Firestore
+                        labels.append(ts.strftime('%H:%M:%S'))
+                    else:
+                        # Fallback se è rimasta qualche vecchia stringa nel DB
+                        labels.append(str(ts))
                 values = []
                 
                 for r in results:
@@ -301,82 +312,112 @@ def statistics_page():
     if 'user' not in session:
         return redirect(url_for('login'))
 
-    # 1. Recupero parametri dai filtri (Utenti e Sessioni dinamici)
-    try:
-        docs_u = db.collection('dati_sensori').select(['user']).limit(200).stream()
-        lista_utenti = sorted(list(set([d.to_dict().get('user') for d in docs_u if d.to_dict().get('user')])))
-        
-        docs_s = db.collection('dati_sensori').select(['session']).limit(200).stream()
-        lista_sessioni = sorted(list(set([d.to_dict().get('session') for d in docs_s if d.to_dict().get('session')])))
+    # 1. Recupero parametri (User e Session)
+    docs_u = db.collection('dati_sensori').select(['user']).limit(200).stream()
+    lista_utenti = sorted(list(set([d.to_dict().get('user') for d in docs_u if d.to_dict().get('user')])))
+    
+    docs_s = db.collection('dati_sensori').select(['session']).limit(200).stream()
+    lista_sessioni = sorted(list(set([d.to_dict().get('session') for d in docs_s if d.to_dict().get('session')])))
 
-        selected_user = request.args.get('u', lista_utenti[0] if lista_utenti else "")
-        selected_sess = request.args.get('s', lista_sessioni[0] if lista_sessioni else "01")
-    except Exception as e:
-        return f"Errore nel recupero filtri: {e}"
+    u_raw = request.args.get('u', "")
+    selected_user = str(u_raw).zfill(2) if u_raw else (lista_utenti[0] if lista_utenti else "01")
+    
+    s_raw = request.args.get('s', "")
+    selected_sess = str(s_raw).zfill(2) if s_raw else "01"
 
     stats_results = {}
-    sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
-
-    # 2. Query per l'ultima settimana
-    una_settimana_fa = datetime.now() - timedelta(days=7)
-
-    for s in sensori:
-        try:
-            query = db.collection('dati_sensori')\
-                      .where('user', '==', selected_user)\
-                      .where('sensor', '==', s)\
-                      .where('session', '==', selected_sess)\
-                      .where('data_ricezione', '>=', una_settimana_fa)\
-                      .stream()
+    sensori_nomi = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
+    
+    try:
+        # Cerchiamo l'ultimo record per QUELLO specifico utente e QUELLA sessione
+        # Nota: togliamo il filtro 'sensor'== 'ACC' per essere sicuri di trovare QUALSIASI dato
+        last_record_query = db.collection('dati_sensori')\
+                                .where('user', '==', selected_user)\
+                                .where('session', '==', selected_sess)\
+                                .order_by('timestamp', direction=firestore.Query.DESCENDING)\
+                                .limit(1).get()
+        
+        if last_record_query:
+            ultima_data_db = last_record_query[0].to_dict().get('timestamp')
+            data_inizio_filtro = ultima_data_db - timedelta(days=7)
             
-            vals = []
-            for d in query:
-                try:
+            for s in sensori_nomi:
+                query = db.collection('dati_sensori')\
+                          .where('user', '==', selected_user)\
+                          .where('session', '==', selected_sess)\
+                          .where('sensor', '==', s)\
+                          .where('timestamp', '>=', data_inizio_filtro)\
+                          .stream()
+                
+                vals = []
+                for d in query:
                     row = d.to_dict()
-                    v_raw = row.get('valori', '{}')
-                    v_dict = json.loads(v_raw.replace("'", '"')) if isinstance(v_raw, str) else v_raw
-                    
-                    if s == "ACC":
-                        # Magnitudo dell'accelerometro
-                        ax = float(v_dict.get('ax', 0))
-                        ay = float(v_dict.get('ay', 0))
-                        az = float(v_dict.get('az', 0))
-                        vals.append(round(math.sqrt(ax**2 + ay**2 + az**2), 2))
-                    else:
-                        # Altri sensori (prende il primo valore numerico disponibile)
-                        vals.append(float(next(iter(v_dict.values()))))
-                except:
-                    continue
+                    v_raw = row.get('valori', {})
 
-            # 3. Calcolo dei parametri (Media, Moda, Mediana, Max, Min)
-            if vals:
-                # Calcolo Moda con statistics (sen Scipy)
-                # multimode gestisce i casi con più mode restituendo una lista
-                mode_list = statistics.multimode(vals)
-                moda_val = mode_list[0] if mode_list else vals[0]
+                    # Forza la conversione se v_raw è una stringa JSON
+                    if isinstance(v_raw, str):
+                        try: v_raw = json.loads(v_raw.replace("'", '"'))
+                        except: continue
 
-                stats_results[s] = {
-                    "media": round(statistics.mean(vals), 2),
-                    "mediana": round(statistics.median(vals), 2),
-                    "moda": round(moda_val, 2),
-                    "max": round(max(vals), 2),
-                    "min": round(min(vals), 2),
-                    "count": len(vals)
-                }
-            else:
-                stats_results[s] = None
-        except Exception as e:
-            print(f"Errore calcolo sensore {s}: {e}")
-            stats_results[s] = None
+                    if isinstance(v_raw, dict):
+                        if s == "ACC":
+                            try:
+                                # Gestiamo sia ax che AX
+                                ax = float(v_raw.get('ax') or v_raw.get('AX') or 0)
+                                ay = float(v_raw.get('ay') or v_raw.get('AY') or 0)
+                                az = float(v_raw.get('az') or v_raw.get('AZ') or 0)
+                                vals.append(math.sqrt(ax**2 + ay**2 + az**2))
+                            except: continue
+                        else:
+                            # Prende il primo valore disponibile trasformando la chiave in minuscolo
+                            # Es: se cerchiamo BVP e nel db è "bvp": "-21.19"
+                            target_key = s.lower()
+                            valore_trovato = v_raw.get(target_key)
+                            
+                            if valore_trovato is None: # Se non lo trova minuscolo, prova il primo che capita
+                                valore_trovato = next(iter(v_raw.values()), None)
+                            
+                            try:
+                                if valore_trovato is not None:
+                                    vals.append(float(valore_trovato))
+                            except: continue
+
+                if vals:
+                    stats_results[s] = {
+                        "media": round(statistics.mean(vals), 2),
+                        "mediana": round(statistics.median(vals), 2),
+                        "moda": round(statistics.multimode(vals)[0], 2),
+                        "max": round(max(vals), 2),
+                        "min": round(min(vals), 2),
+                        "count": len(vals)
+                    }
+                else:
+                    stats_results[s] = None
+
+            # --- SALVATAGGIO ---
+            if any(v is not None for v in stats_results.values()):
+                doc_id = f"{selected_user}_{selected_sess}"
+                db.collection('statistiche').document(doc_id).set({
+                    'user': selected_user,
+                    'session': selected_sess,
+                    'last_update': datetime.now(),
+                    'stats': stats_results
+                })
+        else:
+            # Se entra qui, significa che Utente + Sessione non esistono nel DB
+            for s in sensori_nomi: stats_results[s] = None
+
+    except Exception as e:
+        print(f"ERRORE DURANTE IL CALCOLO: {e}")
 
     return render_template_string(HTML_STATS_TEMPLATE, 
                                   stats=stats_results, 
                                   utenti=lista_utenti, 
                                   sessioni=lista_sessioni,
                                   selected_u=selected_user, 
-                                  selected_s=selected_sess)
+                                  selected_s=selected_sess,
+                                  last_calc=datetime.now().strftime('%d/%m/%Y %H:%M:%S'))
 
-# --- TEMPLATE HTML ---
 HTML_STATS_TEMPLATE = '''
 <!DOCTYPE html>
 <html>
@@ -386,7 +427,7 @@ HTML_STATS_TEMPLATE = '''
         body { font-family: 'Segoe UI', sans-serif; background: #f0f2f5; margin: 0; }
         .navbar { background: #1a73e8; color: white; padding: 15px 30px; display: flex; justify-content: space-between; align-items: center; }
         .container { max-width: 1100px; margin: 20px auto; padding: 20px; }
-        .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
+        .card { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
         table { width: 100%; border-collapse: collapse; margin-top: 20px; }
         th, td { padding: 12px; border-bottom: 1px solid #eee; text-align: center; }
         th { background: #f8f9fa; color: #1a73e8; font-size: 0.9rem; }
@@ -394,6 +435,7 @@ HTML_STATS_TEMPLATE = '''
         .controls { margin-bottom: 20px; display: flex; gap: 15px; background: white; padding: 15px; border-radius: 8px; align-items: center; }
         select { padding: 8px; border-radius: 5px; border: 1px solid #ddd; }
         .btn-back { color:white; text-decoration:none; background:rgba(255,255,255,0.2); padding:8px 15px; border-radius:5px; }
+        .save-badge { background: #e6fffa; color: #00875a; padding: 5px 12px; border-radius: 20px; font-size: 0.75rem; border: 1px solid #b2f5ea; }
     </style>
 </head>
 <body>
@@ -413,8 +455,15 @@ HTML_STATS_TEMPLATE = '''
             </select>
             <span style="margin-left:auto; color: #666; font-size: 0.8rem;">Range: Ultimi 7 giorni</span>
         </div>
+        
         <div class="card">
-            <h3>Parametri Riassuntivi</h3>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h3 style="margin:0; color:#1a73e8;">Parametri Riassuntivi</h3>
+                <div class="save-badge">
+                    ● Database aggiornato: {{ last_calc }}
+                </div>
+            </div>
+            
             <table>
                 <thead>
                     <tr>
