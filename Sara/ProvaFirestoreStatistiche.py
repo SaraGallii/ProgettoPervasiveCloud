@@ -349,7 +349,7 @@ def statistics_admin():
                     data_fine = raw_timestamp
                 
                 # Ora la sottrazione funzionerà correttamente
-                data_inizio = data_fine - timedelta(days=7)
+                data_inizio = data_fine - timedelta(days=365*10)
                 
             except Exception as e:
                 print(f"Errore conversione data: {e}")
