@@ -314,8 +314,8 @@ def statistics_admin():
 
     selected_user = request.args.get('u')
     
-    # Recupero lista utenti per il selettore
-    docs_u = db.collection('dati_sensori').select(['user']).limit(100).stream()
+    # 1. Recupero lista utenti univoci
+    docs_u = db.collection('dati_sensori').select(['user']).limit(500).stream()
     lista_utenti = sorted(list(set([d.to_dict().get('user') for d in docs_u if d.to_dict().get('user')])))
     
     if not selected_user and lista_utenti:
@@ -327,7 +327,7 @@ def statistics_admin():
         for sess in ['01', '02', '03']:
             report_finale[sess] = []
             
-            # 1. Trova l'ultimo timestamp disponibile
+            # 2. Trova l'ultimo timestamp disponibile per "agganciare" il dataset al 2021
             query_last = db.collection('dati_sensori')\
                            .where('user', '==', selected_user)\
                            .where('session', '==', sess)\
@@ -337,27 +337,29 @@ def statistics_admin():
             if not query_last:
                 continue
                 
-            # RECUPERO E CONVERSIONE DATA
             raw_timestamp = query_last[0].to_dict()['timestamp']
             
+            # Gestione conversione data (Stringa vs Timestamp) e Fuso Orario
             try:
                 if isinstance(raw_timestamp, str):
-                    # Se è una stringa, usiamo il parser per convertirla in datetime
                     data_fine = parser.parse(raw_timestamp)
                 else:
-                    # Se è già un oggetto timestamp di Firestore
                     data_fine = raw_timestamp
                 
-                # Ora la sottrazione funzionerà correttamente
-                data_inizio = data_fine - timedelta(days=365*10)
+                # Sincronizzazione fusi orari (essenziale per il confronto >= <=)
+                if data_fine.tzinfo is None:
+                    data_fine = data_fine.replace(tzinfo=pytz.UTC)
+                
+                # Definiamo la finestra di 7 giorni nel passato (rispetto al dataset)
+                data_inizio = data_fine - timedelta(days=7)
                 
             except Exception as e:
-                print(f"Errore conversione data: {e}")
+                print(f"Errore data utente {selected_user}: {e}")
                 continue
 
             sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
             for s in sensori:
-                # 2. Query per il range temporale identificato
+                # 3. Query filtrata per utente, sessione, sensore e finestra temporale
                 docs = db.collection('dati_sensori')\
                          .where('user', '==', selected_user)\
                          .where('session', '==', sess)\
@@ -368,24 +370,30 @@ def statistics_admin():
 
                 valori = []
                 for d in docs:
-                    v_raw = d.to_dict().get('valori')
+                    dati_doc = d.to_dict()
+                    v_raw = dati_doc.get('valori', {}) # Accede al campo 'valori' che è un dizionario
+                    
                     try:
                         if s == "ACC":
+                            # Formula magnitudo per accelerometro
                             ax = float(v_raw.get('ax', v_raw.get('x', 0)))
                             ay = float(v_raw.get('ay', v_raw.get('y', 0)))
                             az = float(v_raw.get('az', v_raw.get('z', 0)))
                             valori.append(math.sqrt(ax**2 + ay**2 + az**2))
                         else:
-                            valori.append(float(next(iter(v_raw.values()))))
+                            # Per gli altri sensori prende il primo valore numerico trovato nel dizionario
+                            val_list = [float(v) for v in v_raw.values() if str(v).replace('.','',1).isdigit()]
+                            if val_list:
+                                valori.append(val_list[0])
                     except: continue
 
                 if valori:
-                    # 3. Calcolo parametri
+                    # 4. Calcolo statistiche
                     s_media = round(statistics.mean(valori), 2)
                     s_min = round(min(valori), 2)
                     s_max = round(max(valori), 2)
 
-                    # 4. Salvataggio su Firestore
+                    # 5. Salvataggio persistente su nuova tabella 'statistiche_settimanali'
                     stat_id = f"{selected_user}_{sess}_{s}"
                     db.collection('statistiche_settimanali').document(stat_id).set({
                         'user': selected_user,
@@ -394,15 +402,17 @@ def statistics_admin():
                         'media': s_media,
                         'min': s_min,
                         'max': s_max,
-                        'data_elaborazione': datetime.now(),
-                        'intervallo_dati': f"{data_inizio.strftime('%d/%m/%Y')} - {data_fine.strftime('%d/%m/%Y')}"
+                        'data_calcolo': datetime.now(pytz.UTC),
+                        'intervallo_temporale': f"{data_inizio.strftime('%d/%m/%Y')} - {data_fine.strftime('%d/%m/%Y')}"
                     })
 
                     report_finale[sess].append({
                         'sensor': s, 'media': s_media, 'min': s_min, 'max': s_max
                     })
 
-    return render_template_string(HTML_STATS_SIMPLE, utenti=lista_utenti, report=report_finale, sel_u=selected_user)    
+    return render_template_string(HTML_STATS_SIMPLE, utenti=lista_utenti, report=report_finale, sel_u=selected_user)
+
+
 
 
 HTML_STATS_SIMPLE = '''
