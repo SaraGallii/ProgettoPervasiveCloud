@@ -312,69 +312,66 @@ def statistics_page():
     if 'user' not in session:
         return redirect(url_for('login'))
 
-    # 1. Recupero parametri (User e Session)
-    docs_u = db.collection('dati_sensori').select(['user']).limit(200).stream()
+    # 1. Recupero parametri dai menu a tendina (per la visualizzazione)
+    # Usiamo set() per evitare duplicati e sorted() per l'ordine (01, 02, 03...)
+    docs_u = db.collection('dati_sensori').select(['user']).limit(500).stream()
     lista_utenti = sorted(list(set([d.to_dict().get('user') for d in docs_u if d.to_dict().get('user')])))
     
-    docs_s = db.collection('dati_sensori').select(['session']).limit(200).stream()
+    docs_s = db.collection('dati_sensori').select(['session']).limit(500).stream()
     lista_sessioni = sorted(list(set([d.to_dict().get('session') for d in docs_s if d.to_dict().get('session')])))
 
+    # Recupero selezione attuale dall'URL
     u_raw = request.args.get('u', "")
-    selected_user = str(u_raw).zfill(2) if u_raw else (lista_utenti[0] if lista_utenti else "")
+    selected_user = str(u_raw).zfill(2) if u_raw else (lista_utenti[0] if lista_utenti else "01")
     
-    s_raw = request.args.get('s', "01")
-    selected_sess = str(s_raw).zfill(2)
+    s_raw = request.args.get('s', "")
+    selected_sess = str(s_raw).zfill(2) if s_raw else (lista_sessioni[0] if lista_sessioni else "01")
 
     stats_results = {}
     sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
-    data_salvataggio_avvenuto = False # Flag per il salvataggio
     
     try:
-        # Cerchiamo l'ultimo record per definire la finestra temporale (Agosto 2021)
+        # Cerchiamo l'ultimo record della sessione specifica per trovare la data di fine
         last_record_query = db.collection('dati_sensori')\
                                 .where('user', '==', selected_user)\
                                 .where('session', '==', selected_sess)\
-                                .where('sensor', '==', 'ACC')\
                                 .order_by('timestamp', direction=firestore.Query.DESCENDING)\
                                 .limit(1).get()
         
         if last_record_query:
             ultima_data_db = last_record_query[0].to_dict().get('timestamp')
-            # Calcolo i 7 giorni precedenti
             data_inizio_filtro = ultima_data_db - timedelta(days=7)
             
-            print(f"DEBUG: Finestra temporale: {data_inizio_filtro} -> {ultima_data_db}")
-            
             for s in sensori:
+                # Query specifica per UTENTE, SESSIONE e SENSORE
                 query = db.collection('dati_sensori')\
                           .where('user', '==', selected_user)\
                           .where('session', '==', selected_sess)\
                           .where('sensor', '==', s)\
                           .where('timestamp', '>=', data_inizio_filtro)\
-                          .where('timestamp', '<=', ultima_data_db)\
                           .stream()
                 
                 vals = []
                 for d in query:
-                    row = d.to_dict()
-                    v_raw = row.get('valori', {})
+                    v_raw = d.to_dict().get('valori', {})
                     
-                    # Gestione stringhe JSON o Mappe
-                    if isinstance(v_raw, str):
-                        try: v_raw = json.loads(v_raw.replace("'", '"'))
-                        except: continue
-
-                    try:
+                    # Gestione flessibile del dizionario 'valori'
+                    if isinstance(v_raw, dict):
                         if s == "ACC":
-                            ax = float(v_raw.get('ax', 0))
-                            ay = float(v_raw.get('ay', 0))
-                            az = float(v_raw.get('az', 0))
-                            vals.append(math.sqrt(ax**2 + ay**2 + az**2))
+                            # Calcolo modulo accelerazione se i campi esistono
+                            try:
+                                ax = float(v_raw.get('ax', 0))
+                                ay = float(v_raw.get('ay', 0))
+                                az = float(v_raw.get('az', 0))
+                                vals.append(math.sqrt(ax**2 + ay**2 + az**2))
+                            except: continue
                         else:
-                            if v_raw:
-                                val_str = next(iter(v_raw.values()))
-                                vals.append(float(val_str))
-                    except: continue
+                            # Prende il primo valore numerico disponibile (es. bvp, hr, temp...)
+                            for k, val in v_raw.items():
+                                try:
+                                    vals.append(float(val))
+                                    break # Prendi solo il primo valore della mappa
+                                except: continue
 
                 if vals:
                     stats_results[s] = {
@@ -387,45 +384,32 @@ def statistics_page():
                     }
                 else:
                     stats_results[s] = None
-            
-            # --- CORREZIONE LOGICA SALVATAGGIO ---
-            # Controlliamo se abbiamo almeno un sensore con dati validi
-            ha_dati_reali = any(res is not None for res in stats_results.values())
-            
-            if ha_dati_reali:
+
+            # --- SALVATAGGIO SU FIRESTORE ---
+            # Salviamo solo se abbiamo trovato almeno un dato
+            if any(v is not None for v in stats_results.values()):
                 doc_id = f"{selected_user}_{selected_sess}"
                 db.collection('statistiche').document(doc_id).set({
                     'user': selected_user,
                     'session': selected_sess,
                     'last_update': datetime.now(),
                     'stats': stats_results,
-                    'periodo_riferimento': {
-                        'inizio': data_inizio_filtro,
-                        'fine': ultima_data_db
-                    }
+                    'range_analisi': {'inizio': data_inizio_filtro, 'fine': ultima_data_db}
                 })
-                data_salvataggio_avvenuto = True
-                print(f"DEBUG: Salvataggio riuscito per {doc_id}")
-            else:
-                print("DEBUG: Nessun dato trovato nei 7 giorni selezionati.")
-
         else:
-            print(f"DEBUG: Nessun record ACC trovato per User {selected_user} Session {selected_sess}")
+            print(f"DEBUG: Nessun dato trovato per Utente {selected_user} Sessione {selected_sess}")
             for s in sensori: stats_results[s] = None
 
     except Exception as e:
-        print(f"ERRORE CRITICO: {e}")
-        # Se l'errore riguarda gli indici, apparirà qui nel log
+        print(f"ERRORE: {e}")
 
-    aggiornato_il = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
     return render_template_string(HTML_STATS_TEMPLATE, 
                                   stats=stats_results, 
                                   utenti=lista_utenti, 
                                   sessioni=lista_sessioni,
                                   selected_u=selected_user, 
                                   selected_s=selected_sess,
-                                  last_calc=aggiornato_il,
-                                  salvato=data_salvataggio_avvenuto)
+                                  last_calc=datetime.now().strftime('%d/%m/%Y %H:%M:%S'))
 
 HTML_STATS_TEMPLATE = '''
 <!DOCTYPE html>
