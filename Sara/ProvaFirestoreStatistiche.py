@@ -313,149 +313,147 @@ def statistics_admin():
         return redirect(url_for('login'))
 
     selected_user = request.args.get('u')
-    selected_sess = request.args.get('s', '01')
     
-    # Recupero lista utenti per il menu a tendina
+    # Recupero lista utenti per il selettore
     docs_u = db.collection('dati_sensori').select(['user']).limit(100).stream()
     lista_utenti = sorted(list(set([d.to_dict().get('user') for d in docs_u if d.to_dict().get('user')])))
     
     if not selected_user and lista_utenti:
         selected_user = lista_utenti[0]
 
-    stats_display = []
-    anomalie = []
-
-    # Definiamo soglie arbitrarie per le anomalie (da regolare in base alla documentazione E4)
-    soglie = {
-        "HR": 100,    # Battito > 100 bpm
-        "TEMP": 37.5, # Temperatura > 37.5°C
-        "EDA": 5.0    # Stress elevato
-    }
+    report_finale = {} 
 
     if selected_user:
-        sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
-        
-        for s in sensori:
-            # Recuperiamo gli ultimi 100 dati per calcolare medie e statistiche
-            query = db.collection('dati_sensori')\
-                      .where('user', '==', selected_user)\
-                      .where('sensor', '==', s)\
-                      .where('session', '==', selected_sess)\
-                      .order_by('timestamp', direction=firestore.Query.DESCENDING)\
-                      .limit(100)
+        for sess in ['01', '02', '03']:
+            report_finale[sess] = []
             
-            docs = [d.to_dict() for d in query.stream()]
+            # 1. Trova l'ultimo timestamp disponibile nel dataset per questo utente/sessione
+            query_last = db.collection('dati_sensori')\
+                           .where('user', '==', selected_user)\
+                           .where('session', '==', sess)\
+                           .order_by('timestamp', direction=firestore.Query.DESCENDING)\
+                           .limit(1).get()
             
-            if not docs:
+            if not query_last:
                 continue
-
-            # Estrazione valori numerici
-            values = []
-            for d in docs:
-                val_raw = d.get('valori')
-                if isinstance(val_raw, dict):
-                    # Se ACC, calcoliamo magnitudo, altrimenti prendiamo il primo valore
-                    if s == "ACC":
-                        ax = float(val_raw.get('ax', 0))
-                        ay = float(val_raw.get('ay', 0))
-                        az = float(val_raw.get('az', 0))
-                        values.append(math.sqrt(ax**2 + ay**2 + az**2))
-                    else:
-                        values.append(float(next(iter(val_raw.values()))))
-                elif isinstance(val_raw, (int, float)):
-                    values.append(float(val_raw))
-
-            if values:
-                # 1. Media Storica (degli ultimi 100)
-                media_tot = statistics.mean(values)
                 
-                # 2. Media Mobile (ultime 5 rilevazioni)
-                x_size = 5
-                media_mobile = statistics.mean(values[:x_size]) if len(values) >= x_size else media_tot
-                
-                # 3. Controllo Anomalie
-                status = "Normale"
-                if s in soglie and media_mobile > soglie[s]:
-                    status = "ANOMALIA"
-                    anomalie.append(f"Attenzione: {s} elevato ({round(media_mobile, 2)}) per utente {selected_user}")
+            data_fine = query_last[0].to_dict()['timestamp']
+            data_inizio = data_fine - timedelta(days=7) # Finestra di 7 giorni nel 2021
 
-                stats_display.append({
-                    "sensore": s,
-                    "media_storica": round(media_tot, 2),
-                    "media_mobile": round(media_mobile, 2),
-                    "ultimo_valore": round(values[0], 2),
-                    "stato": status
-                })
+            sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
+            for s in sensori:
+                # 2. Query per il range temporale identificato
+                docs = db.collection('dati_sensori')\
+                         .where('user', '==', selected_user)\
+                         .where('session', '==', sess)\
+                         .where('sensor', '==', s)\
+                         .where('timestamp', '>=', data_inizio)\
+                         .where('timestamp', '<=', data_fine)\
+                         .stream()
 
-    return render_template_string('''
+                valori = []
+                for d in docs:
+                    v_raw = d.to_dict().get('valori')
+                    try:
+                        if s == "ACC":
+                            ax = float(v_raw.get('ax', v_raw.get('x', 0)))
+                            ay = float(v_raw.get('ay', v_raw.get('y', 0)))
+                            az = float(v_raw.get('az', v_raw.get('z', 0)))
+                            valori.append(math.sqrt(ax**2 + ay**2 + az**2))
+                        else:
+                            valori.append(float(next(iter(v_raw.values()))))
+                    except: continue
+
+                if valori:
+                    # 3. Calcolo parametri semplificati
+                    s_media = round(statistics.mean(valori), 2)
+                    s_min = round(min(valori), 2)
+                    s_max = round(max(valori), 2)
+
+                    # 4. Salvataggio su Firestore nella collezione 'statistiche_settimanali'
+                    stat_id = f"{selected_user}_{sess}_{s}"
+                    db.collection('statistiche_settimanali').document(stat_id).set({
+                        'user': selected_user,
+                        'session': sess,
+                        'sensor': s,
+                        'media': s_media,
+                        'min': s_min,
+                        'max': s_max,
+                        'data_elaborazione': datetime.now(),
+                        'intervallo_dati': f"{data_inizio.strftime('%d/%m/%Y')} - {data_fine.strftime('%d/%m/%Y')}"
+                    })
+
+                    report_finale[sess].append({
+                        'sensor': s, 'media': s_media, 'min': s_min, 'max': s_max
+                    })
+
+    return render_template_string(HTML_STATS_SIMPLE, utenti=lista_utenti, report=report_finale, sel_u=selected_user)
+
+HTML_STATS_SIMPLE = '''
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Statistiche e Anomalie</title>
+    <title>Statistiche Utenti</title>
     <style>
-        body { font-family: sans-serif; background: #f4f7f9; padding: 20px; }
-        .container { max-width: 900px; margin: auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
-        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-        th, td { padding: 12px; border-bottom: 1px solid #ddd; text-align: left; }
-        th { background: #1a73e8; color: white; }
-        .anomalia-box { background: #fee2e2; border: 1px solid #ef4444; color: #b91c1c; padding: 15px; border-radius: 6px; margin-bottom: 20px; }
-        .badge { padding: 4px 8px; border-radius: 4px; font-size: 0.8rem; font-weight: bold; }
-        .badge-ok { background: #dcfce7; color: #15803d; }
-        .badge-error { background: #fee2e2; color: #b91c1c; }
-        .nav { margin-bottom: 20px; }
+        body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #f8f9fa; padding: 20px; }
+        .container { max-width: 900px; margin: auto; }
+        .card { background: white; border-radius: 10px; padding: 20px; margin-bottom: 25px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); }
+        h2 { color: #1a73e8; margin-top: 0; }
+        table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        th, td { padding: 12px; border-bottom: 1px solid #eee; text-align: center; }
+        th { background: #1a73e8; color: white; border: none; }
+        .sensor-label { font-weight: bold; text-align: left; color: #333; }
+        .btn-back { display: inline-block; margin-top: 20px; text-decoration: none; color: #1a73e8; font-weight: bold; }
     </style>
 </head>
 <body>
     <div class="container">
-        <div class="nav"><a href="/dashboard_admin">← Torna alla Dashboard</a></div>
-        <h2>Analisi Statistica e Anomalie</h2>
+        <h1>Report Settimanale Parametri</h1>
         
-        <form method="get">
-            <label>Seleziona Utente:</label>
-            <select name="u" onchange="this.form.submit()">
+        <form method="get" style="margin-bottom: 30px;">
+            <label><b>Seleziona Utente:</b> </label>
+            <select name="u" onchange="this.form.submit()" style="padding: 8px; border-radius: 5px;">
                 {% for u in utenti %}
-                <option value="{{ u }}" {% if u == sel_u %}selected{% endif %}>{{ u }}</option>
+                <option value="{{ u }}" {% if u == sel_u %}selected{% endif %}>Utente {{ u }}</option>
                 {% endfor %}
             </select>
         </form>
 
-        {% if anomalie %}
-        <div class="anomalia-box">
-            <strong>Rilevate {{ anomalie|length }} Anomalie!</strong>
-            <ul>{% for a in anomalie %}<li>{{ a }}</li>{% endfor %}</ul>
+        {% for sess, data_list in report.items() %}
+        <div class="card">
+            <h2>Sessione {{ sess }}</h2>
+            {% if data_list %}
+            <table>
+                <thead>
+                    <tr>
+                        <th style="text-align:left;">Sensore</th>
+                        <th>Media</th>
+                        <th>Minimo</th>
+                        <th>Massimo</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for s in data_list %}
+                    <tr>
+                        <td class="sensor-label">{{ s.sensor }}</td>
+                        <td>{{ s.media }}</td>
+                        <td style="color: #28a745;">{{ s.min }}</td>
+                        <td style="color: #dc3545;">{{ s.max }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            {% else %}
+            <p style="color: #666;">Nessun dato disponibile per questa sessione nel periodo selezionato.</p>
+            {% endif %}
         </div>
-        {% endif %}
+        {% endfor %}
 
-        <table>
-            <thead>
-                <tr>
-                    <th>Sensore</th>
-                    <th>Ultimo Valore</th>
-                    <th>Media Mobile (5)</th>
-                    <th>Media Storica (100)</th>
-                    <th>Stato</th>
-                </tr>
-            </thead>
-            <tbody>
-                {% for s in stats %}
-                <tr>
-                    <td>{{ s.sensore }}</td>
-                    <td>{{ s.ultimo_valore }}</td>
-                    <td>{{ s.media_mobile }}</td>
-                    <td>{{ s.media_storica }}</td>
-                    <td>
-                        <span class="badge {{ 'badge-error' if s.stato == 'ANOMALIA' else 'badge-ok' }}">
-                            {{ s.stato }}
-                        </span>
-                    </td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
+        <a href="/dashboard_admin" class="btn-back">← Torna alla Dashboard</a>
     </div>
 </body>
 </html>
-''', utenti=lista_utenti, stats=stats_display, sel_u=selected_user, anomalie=anomalie)
+'''
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
