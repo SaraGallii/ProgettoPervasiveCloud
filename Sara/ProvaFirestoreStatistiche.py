@@ -19,17 +19,20 @@ def receive_data():
         return jsonify({"status": "error", "message": "No data"}), 400
     try:
         raw_ts = data.get('timestamp')
-        ts_seconds = float(raw_ts) / 1000
-        ts_datetime = datetime.fromtimestamp(float(data.get('timestamp')) / 1000)
+        # 1. Creiamo l'oggetto data/ora corretto
+        ts_datetime = datetime.fromtimestamp(float(raw_ts) / 1000)
         
+        # 2. Prendiamo i valori (es: {"temp": 33.81})
+        valori_data = data.get('data') 
+
         # Salvataggio su Firestore
         doc_ref = db.collection('dati_sensori').document()
         doc_ref.set({
             'user': data.get('user'),
             'session': data.get('session'),
             'sensor': data.get('sensor'),
-            'timestamp': ts_datetime,
-            'valori': json.dumps(data.get('data')),
+            'timestamp': ts_datetime,      # Ora è un vero Timestamp
+            'valori': valori_data,         # Salvato come MAP (non stringa!), meglio per i calcoli
             'data_ricezione': datetime.now()
         })
         return jsonify({"status": "success"}), 200
@@ -139,7 +142,15 @@ def dashboard():
                 results = [d.to_dict() for d in query.stream()]
                 results.reverse() # Ordine cronologico per Chart.js
                 
-                labels = [r.get('timestamp', '') for r in results]
+                labels = []
+                for r in results:
+                    ts = r.get('timestamp')
+                    if ts and hasattr(ts, 'strftime'):
+                        # Se è un oggetto datetime di Firestore
+                        labels.append(ts.strftime('%H:%M:%S'))
+                    else:
+                        # Fallback se è rimasta qualche vecchia stringa nel DB
+                        labels.append(str(ts))
                 values = []
                 
                 for r in results:
