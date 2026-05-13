@@ -332,13 +332,31 @@ def statistics_page():
     # 2. Query con filtro temporale
     for s in sensori:
         try:
-            # QUESTA QUERY RICHIEDE L'INDICE COMPOSITO
-            query = db.collection('dati_sensori')\
-                      .where('user', '==', selected_user)\
-                      .where('session', '==', selected_sess)\
-                      .where('sensor', '==', s)\
-                      .where('timestamp', '>=', una_settimana_fa)\
-                      .stream()
+            # 1. TROVA IL TIMESTAMP PIÙ RECENTE NEL DB PER QUESTO UTENTE
+            # Invece di usare datetime.now() del 2026, cerchiamo l'ultimo dato del 2021
+            last_record_query = db.collection('dati_sensori')\
+                                .where('user', '==', selected_user)\
+                                .order_by('timestamp', direction=firestore.Query.DESCENDING)\
+                                .limit(1).get()
+            
+            if last_record_query:
+                ultima_data_db = last_record_query[0].to_dict().get('timestamp')
+                # 2. CALCOLA IL RANGE: dall'ultima data meno 7 giorni
+                data_inizio_filtro = ultima_data_db - timedelta(days=7)
+            else:
+                # Fallback se non ci sono dati
+                data_inizio_filtro = datetime(2000, 1, 1) 
+                ultima_data_db = "Nessun dato"
+
+            # 3. ESEGUI LE QUERY SUI SENSORI
+            for s in sensori:
+                query = db.collection('dati_sensori')\
+                        .where('user', '==', selected_user)\
+                        .where('session', '==', selected_sess)\
+                        .where('sensor', '==', s)\
+                        .where('timestamp', '>=', data_inizio_filtro)\
+                        .where('timestamp', '<=', ultima_data_db)\
+                        .stream()
             
             vals = []
             for d in query:
