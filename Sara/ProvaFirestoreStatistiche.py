@@ -319,31 +319,43 @@ def statistics_page():
     docs_s = db.collection('dati_sensori').select(['session']).limit(200).stream()
     lista_sessioni = sorted(list(set([d.to_dict().get('session') for d in docs_s if d.to_dict().get('session')])))
 
-    selected_user = request.args.get('u', lista_utenti[0] if lista_utenti else "")
-    selected_sess = request.args.get('s', lista_sessioni[0] if lista_sessioni else "01")
+    # --- INIZIO INTEGRAZIONE LOGICA STRINGHE 03/02 ---
+    # Recupero il valore dal parametro URL (es: ?u=3)
+    u_raw = request.args.get('u', "")
+    if u_raw:
+        # Forza a 2 caratteri: "3" -> "03", "10" -> "10"
+        selected_user = str(u_raw).zfill(2)
+    else:
+        selected_user = lista_utenti[0] if lista_utenti else ""
+
+    # Applichiamo lo stesso per la sessione (es: "2" -> "02")
+    s_raw = request.args.get('s', "01")
+    selected_sess = str(s_raw).zfill(2)
+    # --- FINE INTEGRAZIONE ---
 
     stats_results = {}
     sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
     
     try:
-        # Usiamo il sensore ACC e i parametri stringa per trovare l'ultimo dato del 2021
+        # Eseguiamo la query con selected_user e selected_sess formattati correttamente
+        # Usiamo ACC come riferimento temporale per il 2021
         last_record_query = db.collection('dati_sensori')\
-                                .where('user', '==', str(selected_user))\
-                                .where('session', '==', str(selected_sess))\
+                                .where('user', '==', selected_user)\
+                                .where('session', '==', selected_sess)\
                                 .where('sensor', '==', 'ACC')\
                                 .order_by('timestamp', direction=firestore.Query.DESCENDING)\
                                 .limit(1).get()
         
         if last_record_query:
-            ultima_data_db = last_record_query[0].to_dict().get('timestamp')
+            ultima_data_db = last_record_query[0].to_dict().get('timestamp') # Data del 24/08/2021
             data_inizio_filtro = ultima_data_db - timedelta(days=7)
             
-            print(f"DEBUG: Trovata ancora temporale al {ultima_data_db}")
+            print(f"DEBUG: Cerco dati tra {data_inizio_filtro} e {ultima_data_db} per User {selected_user}")
             
             for s in sensori:
                 query = db.collection('dati_sensori')\
-                          .where('user', '==', str(selected_user))\
-                          .where('session', '==', str(selected_sess))\
+                          .where('user', '==', selected_user)\
+                          .where('session', '==', selected_sess)\
                           .where('sensor', '==', s)\
                           .where('timestamp', '>=', data_inizio_filtro)\
                           .where('timestamp', '<=', ultima_data_db)\
@@ -352,29 +364,24 @@ def statistics_page():
                 vals = []
                 for d in query:
                     row = d.to_dict()
-                    v_raw = row.get('valori', {})
+                    v_raw = row.get('valori', {}) # Questo è una mappa con stringhe
                     
-                    # Gestione robusta: se valori è una stringa JSON, la convertiamo in dizionario
                     if isinstance(v_raw, str):
-                        try:
-                            v_raw = json.loads(v_raw.replace("'", '"'))
+                        try: v_raw = json.loads(v_raw.replace("'", '"'))
                         except: continue
 
                     try:
-                        # CONVERSIONE STRINGA -> FLOAT
                         if s == "ACC":
-                            # Estraiamo le stringhe ax, ay, az e convertiamo in float per il calcolo geometrico
-                            ax = float(v_raw.get('ax', v_raw.get('x', 0)))
-                            ay = float(v_raw.get('ay', v_raw.get('y', 0)))
-                            az = float(v_raw.get('az', v_raw.get('z', 0)))
+                            # Conversione forzata da stringa a float per i calcoli
+                            ax = float(v_raw.get('ax', 0))
+                            ay = float(v_raw.get('ay', 0))
+                            az = float(v_raw.get('az', 0))
                             vals.append(math.sqrt(ax**2 + ay**2 + az**2))
                         else:
-                            # Per gli altri sensori, prendiamo il primo valore della mappa e forziamo float()
                             if v_raw:
-                                valore_stringa = next(iter(v_raw.values()))
-                                vals.append(float(valore_stringa))
-                    except (ValueError, TypeError, StopIteration):
-                        continue # Salta il record se la stringa non è convertibile in numero
+                                val_str = next(iter(v_raw.values()))
+                                vals.append(float(val_str))
+                    except: continue
 
                 if vals:
                     stats_results[s] = {
@@ -388,25 +395,24 @@ def statistics_page():
                 else:
                     stats_results[s] = None
         else:
+            print(f"DEBUG: Nessun dato per User {selected_user} Session {selected_sess}")
             for s in sensori: stats_results[s] = None
-            print("DEBUG: Nessun documento trovato per questa combinazione.")
 
     except Exception as e:
         print(f"ERRORE CRITICO: {e}")
         for s in sensori: stats_results[s] = None
 
-    aggiornato_il = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
-    
-    # Salvataggio risultati calcolati
+    # Salvataggio su Firestore nella raccolta 'statistiche'
     if any(stats_results.values()):
         doc_id = f"{selected_user}_{selected_sess}"
         db.collection('statistiche').document(doc_id).set({
             'user': selected_user,
             'session': selected_sess,
-            'last_update': datetime.now(timezone(timedelta(hours=2))),
+            'last_update': datetime.now(),
             'stats': stats_results
         })
 
+    aggiornato_il = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
     return render_template_string(HTML_STATS_TEMPLATE, 
                                   stats=stats_results, 
                                   utenti=lista_utenti, 
