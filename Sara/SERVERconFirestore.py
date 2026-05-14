@@ -10,7 +10,7 @@ app = Flask(__name__)
 app.secret_key = "p4ssw0rd" 
 
 # Inizializzazione Firestore
-db = firestore.Client.from_service_account_json('progetto-pcloud-5-b8e46802d217.json')
+db = firestore.Client.from_service_account_json('credentials.json')
 
 # --- GESTIONE DATI ---
 @app.route('/data', methods=['POST'])
