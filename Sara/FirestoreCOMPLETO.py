@@ -102,7 +102,6 @@ def logout():
     session.clear()
     return redirect(url_for('login'))
 
-# --- ROTTA DASHBOARD ADMIN ---
 @app.route('/dashboard_admin')
 def dashboard():
     if 'user' not in session or session.get('tipo') != 'admin':
@@ -111,16 +110,20 @@ def dashboard():
     print(f"DEBUG: Accesso dashboard per l'utente {session['user']}")
 
     try:
+        # MODIFICA: Recuperiamo la lista degli utenti direttamente dalla collezione 'utenti'
         try:
-            docs_u = db.collection('dati_sensori').select(['user']).limit(100).stream()
-            lista_utenti = sorted(list(set([d.to_dict().get('user') for d in docs_u if d.to_dict().get('user')])))
+            docs_u = db.collection('utenti').stream()
+            # Estraiamo l'id_utente di ogni documento (es: "01", "02", ecc.) 
+            # che è quello usato nella collezione 'dati_sensori'
+            lista_utenti = sorted(list(set([d.to_dict().get('id_utente') for d in docs_u if d.to_dict().get('id_utente')])))
         except Exception as e:
-            print(f"Errore recupero utenti: {e}")
+            print(f"Errore recupero utenti dal DB utenti: {e}")
             lista_utenti = []
 
         if not lista_utenti:
-            lista_utenti = ["Nessun dato"]
+            lista_utenti = ["Nessun utente creato"]
 
+        # Se l'admin non ha selezionato nulla dal menu a tendina, prendiamo il primo utente della lista
         selected_user = request.args.get('u', lista_utenti[0])
         selected_sess = request.args.get('s', '01') 
         
