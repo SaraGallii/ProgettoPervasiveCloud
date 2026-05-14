@@ -433,95 +433,199 @@ HTML_STATS_SIMPLE = '''
 <html lang="it">
 <head>
     <meta charset="UTF-8">
-    <title>Admin - Statistiche Sensori</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin - Statistiche Avanzate Sensori</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap" rel="stylesheet">
     <style>
-        body { font-family: 'Inter', -apple-system, sans-serif; background: #f0f2f5; color: #1c1e21; padding: 0; margin: 0; }
-        .navbar { background: #1a73e8; color: white; padding: 15px 30px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        .container { max-width: 1100px; margin: 30px auto; padding: 0 20px; }
+        :root {
+            --primary: #1a73e8;
+            --bg: #f8f9fa;
+            --text: #202124;
+            --card-bg: #ffffff;
+            --border: #dadce0;
+        }
+        body { 
+            font-family: 'Inter', sans-serif; 
+            background-color: var(--bg); 
+            color: var(--text); 
+            margin: 0; 
+            padding: 0; 
+        }
+        .header {
+            background-color: var(--primary);
+            color: white;
+            padding: 1.5rem 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .container { 
+            max-width: 1200px; 
+            margin: 2rem auto; 
+            padding: 0 1rem; 
+        }
+        .controls {
+            background: var(--card-bg);
+            padding: 1.5rem;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            margin-bottom: 2rem;
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+        }
+        select {
+            padding: 0.6rem 1.2rem;
+            border-radius: 4px;
+            border: 1px solid var(--border);
+            font-size: 1rem;
+            background: white;
+            cursor: pointer;
+        }
+        .session-card {
+            background: var(--card-bg);
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            padding: 2rem;
+            margin-bottom: 3rem;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+        }
+        .session-title {
+            margin-top: 0;
+            color: var(--primary);
+            font-size: 1.4rem;
+            border-bottom: 2px solid var(--bg);
+            padding-bottom: 1rem;
+            margin-bottom: 1.5rem;
+            display: flex;
+            justify-content: space-between;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 1rem;
+        }
+        th {
+            background-color: #f1f3f4;
+            color: #5f6368;
+            font-weight: 600;
+            text-transform: uppercase;
+            font-size: 0.85rem;
+            letter-spacing: 0.5px;
+            padding: 12px;
+            border: 1px solid var(--border);
+        }
+        td {
+            padding: 15px;
+            text-align: center;
+            border: 1px solid var(--border);
+            font-variant-numeric: tabular-nums;
+        }
+        .row-label {
+            background-color: #f8f9fa;
+            font-weight: 600;
+            text-align: left;
+            width: 150px;
+            color: #3c4043;
+        }
+        .val-media { color: var(--primary); font-weight: 600; font-size: 1.1rem; }
+        .val-min { color: #188038; } /* Verde */
+        .val-max { color: #d93025; } /* Rosso */
         
-        .user-selector { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); margin-bottom: 30px; display: flex; align-items: center; gap: 15px; }
-        select { padding: 10px 15px; border-radius: 8px; border: 1px solid #ddd; font-size: 16px; min-width: 200px; background: white; }
-        
-        .card { background: white; border-radius: 16px; padding: 25px; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); border-top: 5px solid #1a73e8; margin-bottom: 40px; }
-        .card h2 { margin-top: 0; color: #1a73e8; font-size: 1.3rem; border-bottom: 1px solid #eee; padding-bottom: 15px; margin-bottom: 20px; }
-        
-        table { width: 100%; border-collapse: collapse; table-layout: fixed; }
-        th, td { padding: 12px; border: 1px solid #edf2f7; text-align: center; font-size: 14px; }
-        th { background: #f8fafc; color: #64748b; text-transform: uppercase; font-size: 12px; letter-spacing: 0.05em; }
-        
-        .row-label { background: #f8fafc; font-weight: bold; color: #1e293b; text-align: left; width: 120px; }
-        .val-media { font-weight: bold; color: #1a73e8; font-size: 1.1rem; }
-        .val-min { color: #10b981; }
-        .val-max { color: #ef4444; }
-        
-        .btn-back { color: white; text-decoration: none; background: rgba(255,255,255,0.2); padding: 8px 15px; border-radius: 6px; font-size: 14px; }
-        .empty-state { text-align: center; color: #94a3b8; padding: 40px; font-style: italic; background: white; border-radius: 12px; }
+        .empty-state {
+            text-align: center;
+            padding: 3rem;
+            color: #70757a;
+            background: white;
+            border-radius: 8px;
+        }
+        .btn-back {
+            text-decoration: none;
+            color: white;
+            font-weight: 600;
+            border: 1px solid white;
+            padding: 0.5rem 1rem;
+            border-radius: 4px;
+            transition: all 0.2s;
+        }
+        .btn-back:hover {
+            background: white;
+            color: var(--primary);
+        }
     </style>
 </head>
 <body>
-    <div class="navbar">
-        <h2 style="margin:0; font-size: 1.5rem;">Statistiche Empatica E4</h2>
-        <a href="/dashboard_admin" class="btn-back">← Dashboard</a>
+
+<div class="header">
+    <h1 style="margin:0; font-size: 1.5rem;">Statistiche Amministratore</h1>
+    <a href="/dashboard_admin" class="btn-back">Torna alla Dashboard</a>
+</div>
+
+<div class="container">
+    <div class="controls">
+        <label for="u" style="font-weight: 600;">Visualizza dati per:</label>
+        <form method="get" id="userForm">
+            <select name="u" id="u" onchange="document.getElementById('userForm').submit()">
+                {% for u in utenti %}
+                    <option value="{{ u }}" {% if u == sel_u %}selected{% endif %}>Utente: {{ u }}</option>
+                {% endfor %}
+            </select>
+        </form>
     </div>
 
-    <div class="container">
-        <div class="user-selector">
-            <form method="get" style="display: flex; align-items: center; gap: 15px;">
-                <label for="u"><b>Utente:</b></label>
-                <select name="u" id="u" onchange="this.form.submit()">
-                    {% for u in utenti %}
-                        <option value="{{ u }}" {% if u == sel_u %}selected{% endif %}>{{ u }}</option>
-                    {% endfor %}
-                </select>
-            </form>
-            <span style="margin-left: auto; color: #64748b; font-size: 0.85rem;">Range: 7 giorni dall'ultima rilevazione della sessione</span>
-        </div>
-
-        {% if report %}
-            {% for sess, data_list in report.items() %}
-            <div class="card">
-                <h2>Sessione: {{ sess }}</h2>
-                
-                {% if data_list %}
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Statistica</th>
-                            {% for item in data_list %}
-                                <th>{{ item.sensor }}</th>
-                            {% endfor %}
-                        </tr>
-                    </thead>
-                    <tbody>
-                        <tr>
-                            <td class="row-label">Media</td>
-                            {% for item in data_list %}
-                                <td class="val-media">{{ item.media }}</td>
-                            {% endfor %}
-                        </tr>
-                        <tr>
-                            <td class="row-label">Minimo</td>
-                            {% for item in data_list %}
-                                <td class="val-min">{{ item.min }}</td>
-                            {% endfor %}
-                        </tr>
-                        <tr>
-                            <td class="row-label">Massimo</td>
-                            {% for item in data_list %}
-                                <td class="val-max">{{ item.max }}</td>
-                            {% endfor %}
-                        </tr>
-                    </tbody>
-                </table>
-                {% else %}
-                <div class="empty-state">Nessun dato trovato per questa sessione.</div>
-                {% endif %}
+    {% if report %}
+        {% for sess, data_list in report.items() %}
+        <div class="session-card">
+            <div class="session-title">
+                <span>Sessione: <strong>{{ sess }}</strong></span>
+                <small style="color: #70757a; font-size: 0.9rem;">Ultimi 7 giorni</small>
             </div>
-            {% endfor %}
-        {% else %}
-            <div class="empty-state">Nessun utente selezionato o nessun dato presente.</div>
-        {% endif %}
-    </div>
+
+            {% if data_list %}
+            <table>
+                <thead>
+                    <tr>
+                        <th>Metrica</th>
+                        {% for s in data_list %}
+                        <th>{{ s.sensor }}</th>
+                        {% endfor %}
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td class="row-label">VALORE MEDIO</td>
+                        {% for s in data_list %}
+                        <td class="val-media">{{ s.media }}</td>
+                        {% endfor %}
+                    </tr>
+                    <tr>
+                        <td class="row-label">VALORE MINIMO</td>
+                        {% for s in data_list %}
+                        <td class="val-min">{{ s.min }}</td>
+                        {% endfor %}
+                    </tr>
+                    <tr>
+                        <td class="row-label">VALORE MASSIMO</td>
+                        {% for s in data_list %}
+                        <td class="val-max">{{ s.max }}</td>
+                        {% endfor %}
+                    </tr>
+                </tbody>
+            </table>
+            {% else %}
+            <p style="color: #70757a; font-style: italic;">Nessun dato rilevato per questa sessione nell'intervallo temporale.</p>
+            {% endif %}
+        </div>
+        {% endfor %}
+    {% else %}
+        <div class="empty-state">
+            <h3>Nessun dato disponibile</h3>
+            <p>Non sono state trovate sessioni o rilevazioni per l'utente selezionato.</p>
+        </div>
+    {% endif %}
+</div>
+
 </body>
 </html>
 '''
