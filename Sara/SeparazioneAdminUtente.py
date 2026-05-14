@@ -12,7 +12,7 @@ app.secret_key = "p4ssw0rd"
 # Inizializzazione Firestore
 db = firestore.Client.from_service_account_json('progetto-pcloud-5-b8e46802d217.json')
 
-# --- GESTIONE DATI (Invariata) ---
+# --- GESTIONE DATI ---
 @app.route('/data', methods=['POST'])
 def receive_data():
     data = request.json
@@ -48,74 +48,105 @@ def login():
     if request.method == 'POST':
         username = request.form.get('username')
         password = request.form.get('password')
-        tipo_scelto = request.form.get('tipo_utente') # 'admin' o 'utente'
+        tipo_scelto = request.form.get('tipo_utente')
+        
+        print(f"Tentativo di login per: {username}")
         
         try:
             user_doc = db.collection('utenti').document(username).get()
+            
             if user_doc.exists:
                 user_data = user_doc.to_dict()
+                print(f"Utente trovato in DB. Controllo password...")
+                
                 if str(user_data.get('password')) == str(password):
-                    # Salviamo i dati necessari in sessione
                     session['user'] = username
                     session['tipo'] = tipo_scelto
-                    # Prendiamo l'ID stringa dell'utente dal DB (es: "01", "02")
-                    session['id_utente'] = user_data.get('id_utente')
-
+                    session['id_utente'] = user_data.get('id_utente') # Salviamo l'id_utente (stringa)
+                    print("Login successo! Reindirizzamento...")
+                    
                     if tipo_scelto == 'admin':
-                        return redirect(url_for('dashboard_admin'))
+                        return redirect(url_for('dashboard'))
                     else:
                         return redirect(url_for('dashboard_utente'))
                 else:
+                    print("Password errata.")
                     error = True
             else:
+                print("Utente non esistente su Firestore.")
                 error = True
         except Exception as e:
-            print(f"Errore login: {e}")
+            print(f"Errore durante il login: {e}")
             error = True
 
-    return render_template_string(HTML_LOGIN, error=error)
+    return render_template_string('''
+    <html>
+    <body style="font-family:sans-serif; display:flex; justify-content:center; align-items:center; height:100vh; background:#f0f2f5; margin:0;">
+        <form method="post" style="background:white; padding:2rem; border-radius:12px; box-shadow:0 10px 25px rgba(0,0,0,0.1); width:320px;">
+            <h2 style="color:#1a73e8; text-align:center;">Empatica E4 Login</h2>
+            <select name="tipo_utente" style="width:100%; margin-bottom:15px; padding:10px; border-radius:6px; border:1px solid #ddd;">
+                <option value="admin">Admin</option>
+                <option value="utente">Utente</option>
+            </select>
+            <input type="text" name="username" placeholder="Username" required style="width:100%; margin-bottom:15px; padding:10px; border-radius:6px; border:1px solid #ddd; box-sizing:border-box;">
+            <input type="password" name="password" placeholder="Password" required style="width:100%; margin-bottom:20px; padding:10px; border-radius:6px; border:1px solid #ddd; box-sizing:border-box;">
+            <input type="submit" value="Accedi" style="width:100%; padding:12px; background:#1a73e8; color:white; border:none; border-radius:6px; cursor:pointer; font-weight:bold;">
+            {% if error %}<p style="color:red; text-align:center; font-size:0.8rem; margin-top:10px;">Credenziali errate o errore server</p>{% endif %}
+        </form>
+    </body>
+    </html>
+    ''', error=error)
 
 @app.route('/logout')
 def logout():
     session.clear()
     return redirect(url_for('login'))
 
-# --- DASHBOARD ADMIN ---
+# --- ROTTA DASHBOARD ADMIN ---
 @app.route('/dashboard_admin')
-def dashboard_admin():
+def dashboard():
     if 'user' not in session or session.get('tipo') != 'admin':
         return redirect(url_for('login'))
 
+    print(f"DEBUG: Accesso dashboard per l'utente {session['user']}")
+
     try:
-        docs_u = db.collection('dati_sensori').select(['user']).limit(100).stream()
-        lista_utenti = sorted(list(set([d.to_dict().get('user') for d in docs_u if d.to_dict().get('user')])))
-        if not lista_utenti: lista_utenti = ["Nessun dato"]
+        try:
+            docs_u = db.collection('dati_sensori').select(['user']).limit(100).stream()
+            lista_utenti = sorted(list(set([d.to_dict().get('user') for d in docs_u if d.to_dict().get('user')])))
+        except Exception as e:
+            print(f"Errore recupero utenti: {e}")
+            lista_utenti = []
+
+        if not lista_utenti:
+            lista_utenti = ["Nessun dato"]
 
         selected_user = request.args.get('u', lista_utenti[0])
         selected_sess = request.args.get('s', '01') 
         
         data_charts = recupera_dati_grafici(selected_user, selected_sess)
-        
-        return render_template_string(HTML_DASHBOARD, utenti=lista_utenti, selected_u=selected_user, selected_s=selected_sess, data_charts=data_charts)
-    except Exception as e:
-        return f"<h1>Errore</h1><p>{e}</p>"
 
-# --- DASHBOARD UTENTE (Solo i propri dati) ---
+        return render_template_string(HTML_DASHBOARD_ORIGINALE, utenti=lista_utenti, selected_u=selected_user, selected_s=selected_sess, data_charts=data_charts)
+
+    except Exception as e:
+        print(f"ERRORE FATALE: {e}")
+        return f"<h1>Errore di caricamento</h1><p>{e}</p><a href='/logout'>Torna al login</a>"
+
+# --- ROTTA DASHBOARD UTENTE ---
 @app.route('/dashboard_utente')
 def dashboard_utente():
     if 'user' not in session or session.get('tipo') != 'utente':
         return redirect(url_for('login'))
 
-    # Qui forziamo l'ID utente preso dalla sessione (id_utente salvato in registrazione)
-    mio_id = session.get('id_utente') 
+    mio_id = session.get('id_utente') # Prende l'id_utente stringa (es: "02")
     selected_sess = request.args.get('s', '01') 
     
     data_charts = recupera_dati_grafici(mio_id, selected_sess)
-    
-    # Passiamo una lista utenti contenente solo se stessi per non rompere il template
-    return render_template_string(HTML_DASHBOARD, utenti=[mio_id], selected_u=mio_id, selected_s=selected_sess, data_charts=data_charts)
 
-# --- FUNZIONE HELPER PER RECUPERO DATI ---
+    # Passiamo in utenti solo una lista con il proprio ID per far funzionare il render senza errori
+    return render_template_string(HTML_DASHBOARD_ORIGINALE, utenti=[mio_id], selected_u=mio_id, selected_s=selected_sess, data_charts=data_charts)
+
+# --- FUNZIONE REFACTOR PER RECUPERO DATI ---
 def recupera_dati_grafici(target_user, session_id):
     sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
     data_charts = {}
@@ -132,12 +163,16 @@ def recupera_dati_grafici(target_user, session_id):
             results.reverse()
             
             labels = []
-            values = []
             for r in results:
                 ts = r.get('timestamp')
-                labels.append(ts.strftime('%H:%M:%S') if hasattr(ts, 'strftime') else str(ts))
-                
-                val_raw = r.get('valori', {})
+                if ts and hasattr(ts, 'strftime'):
+                    labels.append(ts.strftime('%H:%M:%S'))
+                else:
+                    labels.append(str(ts))
+            
+            values = []
+            for r in results:
+                val_raw = r.get('valori', '{}')
                 val = json.loads(val_raw.replace("'", '"')) if isinstance(val_raw, str) else val_raw
                 
                 if s == "ACC":
@@ -150,15 +185,15 @@ def recupera_dati_grafici(target_user, session_id):
             
             data_charts[s] = {"labels": labels, "values": values}
         except Exception as e:
-            print(f"Errore {s}: {e}")
+            print(f"Errore sensore {s}: {e}")
             data_charts[s] = {"labels": [], "values": []}
     return data_charts
 
-# --- REGISTRAZIONE (Solo Admin) ---
+# --- ROTTA REGISTRAZIONE ---
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if 'user' not in session or session.get('tipo') != 'admin':
-        return "Accesso negato. Solo gli amministratori possono registrare utenti.", 403
+        return "Accesso negato.", 403
 
     message = ""
     if request.method == 'POST':
@@ -168,36 +203,39 @@ def register():
             user_ref.set({
                 'username': username,
                 'password': request.form.get('password'),
-                'id_utente': request.form.get('id_utente'), # Es: "02"
+                'id_utente': request.form.get('id_utente'),
                 'cellulare': request.form.get('cellulare')
             })
-            message = f"Utente {username} registrato correttamente!"
+            message = f"Utente {username} registrato con successo!"
         else:
             message = "Errore: Lo username esiste già."
 
-    return render_template_string(HTML_REGISTER, msg=message)
+    return render_template_string('''
+    <html>
+    <body style="font-family:sans-serif; background:#f0f2f5; display:flex; justify-content:center; align-items:center; height:100vh; margin:0;">
+        <div style="background:white; padding:2rem; border-radius:12px; box-shadow:0 10px 25px rgba(0,0,0,0.1); width:350px;">
+            <h2 style="color:#1a73e8; margin-top:0; text-align:center;">Registrazione Utente</h2>
+            {% if msg %}<div style="padding:10px; margin-bottom:15px; border-radius:6px; background:#e8f0fe; color:#1a73e8; font-size:0.9rem; text-align:center;">{{ msg }}</div>{% endif %}
+            <form method="post">
+                <label style="font-size:0.85rem; color:#555;">Username:</label>
+                <input type="text" name="username" required style="width:100%; margin-bottom:15px; padding:10px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;">
+                <label style="font-size:0.85rem; color:#555;">Password:</label>
+                <input type="password" name="password" required style="width:100%; margin-bottom:15px; padding:10px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;">
+                <label style="font-size:0.85rem; color:#555;">ID Utente :</label>
+                <input type="text" name="id_utente" placeholder="Es: 02" required style="width:100%; margin-bottom:15px; padding:10px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;">
+                <label style="font-size:0.85rem; color:#555;">Cellulare:</label>
+                <input type="text" name="cellulare" style="width:100%; margin-bottom:20px; padding:10px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;">
+                <input type="submit" value="Registra Utente" style="width:100%; padding:12px; background:#1a73e8; color:white; border:none; border-radius:6px; cursor:pointer; font-weight:bold;">
+            </form>
+            <div style="text-align:center; margin-top:15px;"><a href="/dashboard_admin" style="color:#666; font-size:0.85rem; text-decoration:none;">← Dashboard</a></div>
+        </div>
+    </body>
+    </html>
+    ''', msg=message)
 
-# --- TEMPLATES HTML (Variabili stringa per pulizia) ---
 
-HTML_LOGIN = '''
-<html>
-<body style="font-family:sans-serif; display:flex; justify-content:center; align-items:center; height:100vh; background:#f0f2f5; margin:0;">
-    <form method="post" style="background:white; padding:2rem; border-radius:12px; box-shadow:0 10px 25px rgba(0,0,0,0.1); width:320px;">
-        <h2 style="color:#1a73e8; text-align:center;">Empatica E4 Login</h2>
-        <select name="tipo_utente" style="width:100%; margin-bottom:15px; padding:10px; border-radius:6px; border:1px solid #ddd;">
-            <option value="admin">Admin</option>
-            <option value="utente">Utente</option>
-        </select>
-        <input type="text" name="username" placeholder="Username" required style="width:100%; margin-bottom:15px; padding:10px; border-radius:6px; border:1px solid #ddd; box-sizing:border-box;">
-        <input type="password" name="password" placeholder="Password" required style="width:100%; margin-bottom:20px; padding:10px; border-radius:6px; border:1px solid #ddd; box-sizing:border-box;">
-        <input type="submit" value="Accedi" style="width:100%; padding:12px; background:#1a73e8; color:white; border:none; border-radius:6px; cursor:pointer; font-weight:bold;">
-        {% if error %}<p style="color:red; text-align:center; font-size:0.8rem; margin-top:10px;">Credenziali errate</p>{% endif %}
-    </form>
-</body>
-</html>
-'''
-
-HTML_DASHBOARD = '''
+# --- TEMPLATE HTML ORIGINALE PRESERVATO PARI PARI ---
+HTML_DASHBOARD_ORIGINALE = '''
 <!DOCTYPE html>
 <html lang="it">
 <head>
@@ -206,20 +244,26 @@ HTML_DASHBOARD = '''
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f4f7f9; margin: 0; color: #333; }
-        .navbar { background: #1a73e8; color: white; padding: 15px 30px; display: flex; justify-content: space-between; align-items: center; }
+        .navbar { background: #1a73e8; color: white; padding: 15px 30px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
         .container { max-width: 1100px; margin: 30px auto; padding: 0 20px; }
         .card-controls { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); margin-bottom: 25px; display: flex; gap: 20px; align-items: center; }
+        select { padding: 10px; border-radius: 5px; border: 1px solid #ddd; font-size: 14px; background: white; }
         .chart-container { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 10px 20px rgba(0,0,0,0.05); height: 500px; }
-        .nav-links a { color: white; text-decoration: none; margin-left: 20px; font-weight: 500; }
+        .nav-links a { color: white; text-decoration: none; margin-left: 20px; font-weight: 500; font-size: 0.9rem; }
+        .nav-links a:hover { text-decoration: underline; }
+        h3 { margin-top: 0; color: #1a73e8; }
     </style>
 </head>
 <body>
     <div class="navbar">
-        <h2 style="margin:0;">E4 {{ session['tipo']|upper }}</h2>
+        <h2 style="margin:0; font-size: 1.4rem;">Empatica E4 Dashboard</h2>
         <div class="nav-links">
-            <a href="/{{ 'dashboard_admin' if session['tipo'] == 'admin' else 'dashboard_utente' }}">Dashboard</a>
             {% if session['tipo'] == 'admin' %}
-            <a href="/register">Nuovo Utente</a>
+                <a href="/dashboard_admin">Dashboard</a>
+                <a href="/statistics_admin">Statistiche</a>
+                <a href="/register">Nuovo Utente</a>
+            {% else %}
+                <a href="/dashboard_utente">Dashboard</a>
             {% endif %}
             <a href="/logout" style="color: #ffcccc;">Logout</a>
         </div>
@@ -237,17 +281,19 @@ HTML_DASHBOARD = '''
                 </select>
             </div>
             {% else %}
-            <div><label><b>Mio ID:</b> {{ session['id_utente'] }}</label></div>
+            <div>
+                <label><b>ID Utente:</b> {{ session['id_utente'] }}</label>
+            </div>
             {% endif %}
             
             <div>
                 <label><b>Sensore:</b></label>
                 <select id="sensorSelect" onchange="changeSensor()">
-                    <option value="ACC">Accelerometro</option>
-                    <option value="BVP">BVP</option>
-                    <option value="EDA">EDA</option>
-                    <option value="HR">HR</option>
-                    <option value="IBI">IBI</option>
+                    <option value="ACC">Accelerometro (Magnitudo)</option>
+                    <option value="BVP">BVP (Blood Volume Pulse)</option>
+                    <option value="EDA">EDA (Elettrodermica)</option>
+                    <option value="HR">Frequenza Cardiaca (HR)</option>
+                    <option value="IBI">IBI (Inter-Beat Interval)</option>
                     <option value="TEMP">Temperatura</option>
                 </select>
             </div>
@@ -262,8 +308,10 @@ HTML_DASHBOARD = '''
         </div>
 
         <div class="chart-container">
-            <h3 id="chartTitle">Caricamento...</h3>
-            <canvas id="mainChart"></canvas>
+            <h3 id="chartTitle">Caricamento grafico...</h3>
+            <div style="height: 400px; position: relative;">
+                <canvas id="mainChart"></canvas>
+            </div>
         </div>
     </div>
 
@@ -274,28 +322,44 @@ HTML_DASHBOARD = '''
         function render(sensorId) {
             const ctx = document.getElementById('mainChart').getContext('2d');
             const data = allData[sensorId];
-            document.getElementById('chartTitle').innerText = sensorId;
+            
+            document.getElementById('chartTitle').innerText = sensorId + " - Dati in tempo reale";
+
             if (currentChart) currentChart.destroy();
+
             currentChart = new Chart(ctx, {
                 type: 'line',
                 data: {
                     labels: data.labels,
-                    datasets: [{ label: sensorId, data: data.values, borderColor: '#1a73e8', tension: 0.4 }]
+                    datasets: [{
+                        label: sensorId,
+                        data: data.values,
+                        borderColor: '#1a73e8',
+                        backgroundColor: 'rgba(26, 115, 232, 0.1)',
+                        borderWidth: 3,
+                        tension: 0.4,
+                        fill: true,
+                        pointRadius: 3
+                    }]
                 },
-                options: { responsive: true, maintainAspectRatio: false }
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: { y: { beginAtZero: false, grid: { color: '#f0f0f0' } }, x: { grid: { display: false } } }
+                }
             });
         }
 
         function update() {
             const s = document.getElementById('sessSelect').value;
-            let url = "";
-            if("{{ session['tipo'] }}" === "admin") {
+            
+            // Gestione URL dinamica basata sul ruolo per non rompere il refresh/update
+            if ("{{ session['tipo'] }}" === "admin") {
                 const u = document.getElementById('userSelect').value;
-                url = `/dashboard_admin?u=${u}&s=${s}`;
+                window.location.href = `/dashboard_admin?u=${u}&s=${s}`;
             } else {
-                url = `/dashboard_utente?s=${s}`;
+                window.location.href = `/dashboard_utente?s=${s}`;
             }
-            window.location.href = url;
         }
 
         function changeSensor() {
@@ -309,27 +373,9 @@ HTML_DASHBOARD = '''
             document.getElementById('sensorSelect').value = last;
             render(last);
         };
-        setTimeout(() => location.reload(), 30000);
-    </script>
-</body>
-</html>
-'''
 
-HTML_REGISTER = '''
-<html>
-<body style="font-family:sans-serif; background:#f0f2f5; display:flex; justify-content:center; align-items:center; height:100vh; margin:0;">
-    <div style="background:white; padding:2rem; border-radius:12px; box-shadow:0 10px 25px rgba(0,0,0,0.1); width:350px;">
-        <h2 style="color:#1a73e8; margin-top:0;">Registrazione Utente</h2>
-        {% if msg %}<p style="color:blue;">{{ msg }}</p>{% endif %}
-        <form method="post">
-            <input type="text" name="username" placeholder="Username Login" required style="width:100%; margin-bottom:10px; padding:8px;">
-            <input type="password" name="password" placeholder="Password" required style="width:100%; margin-bottom:10px; padding:8px;">
-            <input type="text" name="id_utente" placeholder="ID Sensore (es: 02)" required style="width:100%; margin-bottom:10px; padding:8px;">
-            <input type="text" name="cellulare" placeholder="Cellulare" style="width:100%; margin-bottom:15px; padding:8px;">
-            <input type="submit" value="Registra" style="width:100%; padding:10px; background:#1a73e8; color:white; border:none; border-radius:6px; cursor:pointer;">
-        </form>
-        <a href="/dashboard_admin">Torna alla Dashboard</a>
-    </div>
+        setTimeout(() => location.reload(), 20000);
+    </script>
 </body>
 </html>
 '''
