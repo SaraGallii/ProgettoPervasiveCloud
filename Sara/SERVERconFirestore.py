@@ -6,11 +6,230 @@ import math
 import statistics
 from google.cloud import firestore
 
+import os
+import time
+import threading
+
 app = Flask(__name__)
 app.secret_key = "p4ssw0rd" 
 
 # Inizializzazione Firestore
 db = firestore.Client.from_service_account_json('progetto-pcloud-5-b8e46802d217.json')
+
+# ============================================================
+# STATISTICHE "PRO": buffer in RAM + flush periodico su Firestore
+# ============================================================
+
+# Intervallo flush (secondi). Consigliato 2–5. Default 3.
+STATS_FLUSH_INTERVAL = float(os.environ.get("STATS_FLUSH_INTERVAL", "3.0"))
+
+_stats_lock = threading.Lock()
+_stats_buffer = {}   # key=(user,session,sensor) -> {"user","session","sensor","n","mean","m2","min","max"}
+_flusher_started = False
+
+
+def _to_float(x, default=None):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def estrai_valore_numerico(sensor, valori):
+    """
+    Converte 'valori' in un valore numerico unico su cui calcolare statistiche.
+    - ACC: magnitudo sqrt(ax^2 + ay^2 + az^2) usando ax/ay/az oppure x/y/z
+    - altri sensori: media di tutti i campi numerici presenti (robusto)
+    """
+    if valori is None:
+        return None
+
+    # Se arriva come stringa, prova a convertirla in dict
+    if isinstance(valori, str):
+        try:
+            valori = json.loads(valori)
+        except Exception:
+            try:
+                valori = json.loads(valori.replace("'", '"'))
+            except Exception:
+                return None
+
+    if not isinstance(valori, dict) or not valori:
+        return None
+
+    s = str(sensor).upper().strip()
+
+    if s == "ACC":
+        ax = _to_float(valori.get('ax', valori.get('x', 0)), 0.0)
+        ay = _to_float(valori.get('ay', valori.get('y', 0)), 0.0)
+        az = _to_float(valori.get('az', valori.get('z', 0)), 0.0)
+        return math.sqrt(ax * ax + ay * ay + az * az)
+
+    nums = []
+    for v in valori.values():
+        fv = _to_float(v, None)
+        if fv is not None:
+            nums.append(fv)
+
+    if not nums:
+        return None
+
+    return nums[0] if len(nums) == 1 else (sum(nums) / len(nums))
+
+
+def _buffer_update(user, session_id, sensor, valori):
+    """
+    Aggiorna il buffer in RAM con Welford incrementale per la chiave (user, session, sensor).
+    """
+    x = estrai_valore_numerico(sensor, valori)
+    if x is None:
+        return
+
+    key = (str(user).strip(), str(session_id).strip(), str(sensor).strip())
+    x = float(x)
+
+    with _stats_lock:
+        st = _stats_buffer.get(key)
+        if st is None:
+            _stats_buffer[key] = {
+                "user": key[0],
+                "session": key[1],
+                "sensor": key[2],
+                "n": 1,
+                "mean": x,
+                "m2": 0.0,
+                "min": x,
+                "max": x
+            }
+            return
+
+        n = st["n"]
+        mean = st["mean"]
+        m2 = st["m2"]
+
+        n_new = n + 1
+        delta = x - mean
+        mean_new = mean + delta / n_new
+        delta2 = x - mean_new
+        m2_new = m2 + delta * delta2
+
+        st["n"] = n_new
+        st["mean"] = mean_new
+        st["m2"] = m2_new
+        st["min"] = min(st["min"], x)
+        st["max"] = max(st["max"], x)
+
+
+@firestore.transactional
+def _merge_stats_tx(transaction, doc_ref, delta_stats):
+    """
+    Merge su Firestore: unisce statistiche già presenti con il delta (buffer) via formule Welford.
+    """
+    snap = doc_ref.get(transaction=transaction)
+    now = datetime.now(timezone.utc)
+
+    n2 = int(delta_stats["n"])
+    mean2 = float(delta_stats["mean"])
+    m2_2 = float(delta_stats["m2"])
+    min2 = float(delta_stats["min"])
+    max2 = float(delta_stats["max"])
+
+    if not snap.exists:
+        n = n2
+        mean = mean2
+        m2 = m2_2
+        min_v = min2
+        max_v = max2
+    else:
+        st = snap.to_dict() or {}
+        n1 = int(st.get("count", 0))
+        mean1 = float(st.get("mean", 0.0))
+        m2_1 = float(st.get("m2", 0.0))
+        min1 = st.get("min", min2)
+        max1 = st.get("max", max2)
+
+        if n1 <= 0:
+            n = n2
+            mean = mean2
+            m2 = m2_2
+            min_v = min2
+            max_v = max2
+        else:
+            n = n1 + n2
+            delta = mean2 - mean1
+            mean = mean1 + delta * (n2 / n)
+            m2 = m2_1 + m2_2 + (delta * delta) * (n1 * n2 / n)
+
+            min_v = min(float(min1), min2) if min1 is not None else min2
+            max_v = max(float(max1), max2) if max1 is not None else max2
+
+    # std campionaria
+    if n > 1:
+        var = m2 / (n - 1)
+        std = math.sqrt(var) if var >= 0 else 0.0
+    else:
+        std = 0.0
+
+    transaction.set(doc_ref, {
+        "user": delta_stats["user"],
+        "session": delta_stats["session"],
+        "sensor": delta_stats["sensor"],
+        "count": n,
+        "mean": mean,
+        "min": min_v,
+        "max": max_v,
+        "m2": m2,
+        "std": std,
+        "updated_at": now
+    }, merge=True)
+
+
+def _flush_stats_once():
+    """
+    Svuota il buffer in modo atomico e fa merge su Firestore.
+    ==> Una scrittura per chiave ogni STATS_FLUSH_INTERVAL.
+    """
+    global _stats_buffer
+
+    with _stats_lock:
+        if not _stats_buffer:
+            return
+        to_flush = _stats_buffer
+        _stats_buffer = {}
+
+    for (u, sess, sens), delta_stats in to_flush.items():
+        doc_id = f"{u}_{sess}_{sens}"
+        doc_ref = db.collection("statistiche").document(doc_id)
+        try:
+            tx = db.transaction()
+            _merge_stats_tx(tx, doc_ref, delta_stats)
+        except Exception as e:
+            print(f"[STATS] Errore flush {doc_id}: {e}")
+
+
+def _stats_flusher_loop():
+    while True:
+        time.sleep(STATS_FLUSH_INTERVAL)
+        _flush_stats_once()
+
+
+def start_stats_flusher():
+    """
+    Avvia il thread flusher UNA SOLA VOLTA.
+    Nota: con debug=True Flask avvia un reloader (2 processi). Evitiamo doppio thread.
+    """
+    global _flusher_started
+    if _flusher_started:
+        return
+
+    # Evita double-start col reloader
+    if app.debug and os.environ.get("WERKZEUG_RUN_MAIN") != "true":
+        return
+
+    _flusher_started = True
+    t = threading.Thread(target=_stats_flusher_loop, daemon=True)
+    t.start()
+    print(f"[STATS] Flusher avviato. Interval={STATS_FLUSH_INTERVAL}s")
 
 # --- GESTIONE DATI ---
 @app.route('/data', methods=['POST'])
@@ -32,6 +251,18 @@ def receive_data():
             'valori': valori_data,
             'data_ricezione': datetime.now(timezone(timedelta(hours=2)))
         })
+
+        # ✅ STATISTICHE PRO: aggiorna buffer in RAM (flush ogni STATS_FLUSH_INTERVAL secondi)
+        try:
+            _buffer_update(
+                user=data.get('user'),
+                session_id=data.get('session'),
+                sensor=data.get('sensor'),
+                valori=valori_data
+            )
+        except Exception as e:
+            print(f"[STATS] Errore buffer_update: {e}")
+
         return jsonify({"status": "success"}), 200
     except Exception as e:
         print(f"Errore DB: {e}")
@@ -41,6 +272,11 @@ def receive_data():
 @app.route('/')
 def index():
     return redirect(url_for('login'))
+
+@app.before_request
+def _ensure_stats_flusher():
+    # Si avvia al primo request, una volta sola
+    start_stats_flusher()
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -345,6 +581,42 @@ def dashboard():
         print(f"ERRORE FATALE: {e}")
         return f"<h1>Errore di caricamento</h1><p>{e}</p><a href='/logout'>Torna al login</a>"
 
+@app.route('/statistics_admin')
+def statistics_admin():
+    if 'user' not in session or session.get('tipo') != 'admin':
+        return redirect(url_for('login'))
+
+    # Recupera utenti dalla collezione 'utenti' (come fai in dashboard)
+    try:
+        docs_u = db.collection('utenti').stream()
+        lista_utenti = sorted(list(set([d.to_dict().get('id_utente') for d in docs_u if d.to_dict().get('id_utente')])))
+    except Exception as e:
+        print(f"Errore recupero utenti: {e}")
+        lista_utenti = []
+
+    if not lista_utenti:
+        lista_utenti = ["Nessun utente creato"]
+
+    selected_user = request.args.get('u', lista_utenti[0])
+    selected_sess = request.args.get('s', '01')
+
+    sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
+    stats = {}
+
+    for s in sensori:
+        doc_id = f"{str(selected_user).strip()}_{str(selected_sess).strip()}_{s}"
+        doc = db.collection("statistiche").document(doc_id).get()
+        stats[s] = doc.to_dict() if doc.exists else None
+
+    return render_template_string(
+        HTML_STATISTICHE,
+        utenti=lista_utenti,
+        selected_u=selected_user,
+        selected_s=selected_sess,
+        stats=stats,
+        interval=int(STATS_FLUSH_INTERVAL)
+    )
+
 # --- ROTTA DASHBOARD UTENTE ---
 @app.route('/dashboard_utente')
 def dashboard_utente():
@@ -593,6 +865,101 @@ HTML_DASHBOARD_ORIGINALE = '''
 </body>
 </html>
 '''
+
+HTML_STATISTICHE = '''
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <title>Empatica E4 - Statistiche</title>
+  <style>
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f4f7f9; margin: 0; color: #333; }
+    .navbar { background: #1a73e8; color: white; padding: 15px 30px; display:flex; justify-content:space-between; align-items:center; box-shadow:0 2px 5px rgba(0,0,0,0.1); }
+    .nav-links a { color:white; text-decoration:none; margin-left:20px; font-weight:500; font-size:0.9rem; }
+    .nav-links a:hover { text-decoration: underline; }
+    .container { max-width: 1100px; margin: 30px auto; padding: 0 20px; }
+    .card-controls { background:white; padding:20px; border-radius:10px; box-shadow:0 4px 6px rgba(0,0,0,0.05); margin-bottom:25px; display:flex; gap:20px; align-items:center; }
+    select { padding:10px; border-radius:5px; border:1px solid #ddd; font-size:14px; background:white; }
+    .grid { display:grid; grid-template-columns: repeat(3, 1fr); gap:16px; }
+    .card { background:white; padding:18px; border-radius:12px; box-shadow:0 10px 20px rgba(0,0,0,0.05); }
+    .title { color:#1a73e8; font-weight:700; margin:0 0 10px; }
+    .kpi { display:flex; flex-direction:column; gap:6px; font-size:0.95rem; }
+    .kpi b { color:#555; width:120px; display:inline-block; }
+    .muted { color:#888; font-style:italic; }
+    .pill { display:inline-block; padding:6px 10px; border-radius:999px; background:#e8f0fe; color:#1a73e8; font-weight:600; font-size:0.85rem; }
+  </style>
+</head>
+<body>
+
+  <div class="navbar">
+    <h2 style="margin:0; font-size: 1.4rem;">Empatica E4 Dashboard</h2>
+    <div class="nav-links">
+      <a href="/dashboard_admin">Dashboard</a>
+      <a href="/live_admin">Dati in tempo reale</a>
+      <a href="/statistics_admin" style="text-decoration: underline;">Statistiche</a>
+      <a href="/register">Nuovo Utente</a>
+      <a href="/logout" style="color:#ffcccc;">Logout</a>
+    </div>
+  </div>
+
+  <div class="container">
+    <div class="card-controls">
+      <div>
+        <label><b>Utente:</b></label>
+        <select id="userSelect" onchange="update()">
+          {% for u in utenti %}
+            <option value="{{ u }}" {% if u == selected_u %}selected{% endif %}>{{ u }}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div>
+        <label><b>Sessione:</b></label>
+        <select id="sessSelect" onchange="update()">
+          <option value="01" {% if selected_s == '01' %}selected{% endif %}>01</option>
+          <option value="02" {% if selected_s == '02' %}selected{% endif %}>02</option>
+          <option value="03" {% if selected_s == '03' %}selected{% endif %}>03</option>
+        </select>
+      </div>
+
+      <span class="pill">Flush stats ~ ogni {{ interval }}s</span>
+      <span class="muted">Se non vedi valori, attendi qualche secondo (buffer RAM).</span>
+    </div>
+
+    <div class="grid">
+      {% for sensor, st in stats.items() %}
+        <div class="card">
+          <h3 class="title">{{ sensor }}</h3>
+          {% if st %}
+            <div class="kpi">
+              <div><b>Campioni:</b> {{ st.count }}</div>
+              <div><b>Media:</b> {{ '%.3f'|format(st.mean) }}</div>
+              <div><b>Min:</b> {{ '%.3f'|format(st.min) }}</div>
+              <div><b>Max:</b> {{ '%.3f'|format(st.max) }}</div>
+              <div><b>Dev Std:</b> {{ '%.3f'|format(st.std) }}</div>
+              <div class="muted">Ultimo update: {{ st.updated_at }}</div>
+            </div>
+          {% else %}
+            <div class="muted">Nessuna statistica disponibile (ancora in accumulo o nessun dato).</div>
+          {% endif %}
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+
+<script>
+  function update() {
+    const u = document.getElementById('userSelect').value;
+    const s = document.getElementById('sessSelect').value;
+    window.location.href = `/statistics_admin?u=${u}&s=${s}`;
+  }
+  setTimeout(() => location.reload(), 5000); // refresh pagina ogni 5 sec
+</script>
+
+</body>
+</html>
+'''
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
