@@ -416,7 +416,7 @@ def receive_data():
                 session_id=data.get('session'),
                 sensor=data.get('sensor'),
                 valori=valori_data,
-                t_epoch_sec=ts_datetime.timestamp()
+                t_epoch_sec=time.time()
             )
         except Exception as e:
             print(f"[STATS] Errore window_update: {e}")
