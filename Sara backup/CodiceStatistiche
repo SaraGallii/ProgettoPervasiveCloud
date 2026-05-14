@@ -1,0 +1,207 @@
+from dateutil import parser 
+
+@app.route('/statistics_admin')
+def statistics_admin():
+    if 'user' not in session or session.get('tipo') != 'admin':
+        return redirect(url_for('login'))
+
+    # 1. Recupero lista utenti unica
+    docs_u = db.collection('dati_sensori').select(['user']).limit(1000).stream()
+    lista_utenti = sorted(list(set([d.to_dict().get('user') for d in docs_u if d.to_dict().get('user')])))
+    
+    selected_user = request.args.get('u')
+    if not selected_user and lista_utenti:
+        selected_user = lista_utenti[0]
+
+    report_finale = {} 
+
+    if selected_user:
+        # 2. Recupero dinamico delle sessioni dell'utente (per non saltarne nessuna)
+        docs_s = db.collection('dati_sensori').where('user', '==', selected_user).select(['session']).stream()
+        elenco_sessioni = sorted(list(set([d.to_dict().get('session') for d in docs_s if d.to_dict().get('session')])))
+
+        for sess in elenco_sessioni:
+            report_finale[sess] = []
+            
+            # Cerchiamo l'ultimo timestamp per definire la finestra di 7 giorni
+            query_last = db.collection('dati_sensori')\
+                           .where('user', '==', selected_user)\
+                           .where('session', '==', sess)\
+                           .order_by('timestamp', direction=firestore.Query.DESCENDING)\
+                           .limit(1).get()
+            
+            if not query_last:
+                continue
+                
+            raw_ts = query_last[0].to_dict().get('timestamp')
+            
+            try:
+                # Gestione robusta della data
+                if isinstance(raw_ts, str):
+                    data_fine = parser.parse(raw_ts, fuzzy=True)
+                else:
+                    data_fine = raw_ts
+
+                if data_fine.tzinfo is None:
+                    data_fine = data_fine.replace(tzinfo=pytz.UTC)
+                
+                data_fine = data_fine.replace(microsecond=0)
+                data_inizio = data_fine - timedelta(days=7)
+            except Exception as e:
+                print(f"Errore data per utente {selected_user}: {e}")
+                continue
+
+            sensori_nomi = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
+            
+            for s in sensori_nomi:
+                # Query per il singolo sensore nell'intervallo stabilito
+                docs_sensor = db.collection('dati_sensori')\
+                                 .where('user', '==', selected_user)\
+                                 .where('session', '==', sess)\
+                                 .where('sensor', '==', s)\
+                                 .where('timestamp', '>=', data_inizio)\
+                                 .where('timestamp', '<=', data_fine)\
+                                 .stream()
+
+                valori = []
+                for d in docs_sensor:
+                    v_raw = d.to_dict().get('valori', {})
+                    
+                    # Se i valori sono salvati come stringa JSON (capita con alcuni upload)
+                    if isinstance(v_raw, str):
+                        try: v_raw = json.loads(v_raw.replace("'", '"'))
+                        except: continue
+
+                    try:
+                        if s == "ACC":
+                            # Cerca ax, ay, az sia minuscoli che maiuscoli
+                            ax = float(v_raw.get('ax') or v_raw.get('AX') or v_raw.get('x', 0))
+                            ay = float(v_raw.get('ay') or v_raw.get('AY') or v_raw.get('y', 0))
+                            az = float(v_raw.get('az') or v_raw.get('AZ') or v_raw.get('z', 0))
+                            valori.append(math.sqrt(ax**2 + ay**2 + az**2))
+                        else:
+                            # Cerca la chiave del sensore (es. "HR" o "hr")
+                            # Se non la trova, prende il primo valore disponibile nel dizionario
+                            val_found = v_raw.get(s) or v_raw.get(s.lower())
+                            if val_found is None and v_raw:
+                                val_found = next(iter(v_raw.values()))
+                            
+                            if val_found is not None:
+                                valori.append(float(val_found))
+                    except:
+                        continue
+
+                if valori:
+                    s_media = round(statistics.mean(valori), 2)
+                    s_min = round(min(valori), 2)
+                    s_max = round(max(valori), 2)
+
+                    # Salvataggio/Aggiornamento statistiche
+                    stat_id = f"{selected_user}_{sess}_{s}"
+                    db.collection('statistiche_settimanali').document(stat_id).set({
+                        'user': selected_user,
+                        'session': sess,
+                        'sensor': s,
+                        'media': s_media,
+                        'min': s_min,
+                        'max': s_max,
+                        'data_elaborazione': datetime.now(pytz.UTC),
+                        'intervallo_dati': f"{data_inizio.strftime('%d/%m/%Y')} - {data_fine.strftime('%d/%m/%Y')}"
+                    })
+
+                    report_finale[sess].append({
+                        'sensor': s, 
+                        'media': s_media, 
+                        'min': s_min, 
+                        'max': s_max
+                    })
+
+    return render_template_string(HTML_STATS_TEMPLATE, utenti=lista_utenti, report=report_finale, sel_u=selected_user)
+
+HTML_STATS_TEMPLATE = '''
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <title>Admin - Statistiche Sensori</title>
+    <style>
+        body { font-family: 'Inter', -apple-system, sans-serif; background: #f0f2f5; color: #1c1e21; padding: 40px 20px; margin: 0; }
+        .container { max-width: 1000px; margin: auto; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
+        .user-selector { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); margin-bottom: 30px; }
+        select { padding: 10px 15px; border-radius: 8px; border: 1px solid #ddd; font-size: 16px; min-width: 200px; }
+        
+        .session-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+        .card { background: white; border-radius: 16px; padding: 25px; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); border-top: 5px solid #1a73e8; }
+        .card h2 { margin-top: 0; color: #1a73e8; font-size: 1.2rem; border-bottom: 1px solid #eee; padding-bottom: 10px; }
+        
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th { text-align: left; font-size: 12px; text-transform: uppercase; color: #65676b; padding: 10px 5px; }
+        td { padding: 12px 5px; border-bottom: 1px solid #f0f2f5; font-size: 15px; }
+        
+        .sensor-name { font-weight: 600; color: #4b4b4b; }
+        .val-media { font-weight: bold; color: #1a73e8; }
+        .val-min { color: #2ecc71; font-size: 0.9em; }
+        .val-max { color: #e74c3c; font-size: 0.9em; }
+        
+        .empty-state { text-align: center; color: #8e8e8e; padding: 20px; font-style: italic; }
+        .btn-back { display: inline-block; margin-top: 30px; text-decoration: none; color: #65676b; transition: 0.2s; }
+        .btn-back:hover { color: #1a73e8; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Statistiche Settimanali</h1>
+            <span style="background: #1a73e8; color: white; padding: 5px 12px; border-radius: 20px; font-size: 14px;">Admin Mode</span>
+        </div>
+
+        <div class="user-selector">
+            <form method="get">
+                <label for="u" style="display: block; margin-bottom: 10px; font-weight: bold;">Seleziona un utente per visualizzare i dati:</label>
+                <select name="u" id="u" onchange="this.form.submit()">
+                    <option value="" disabled {% if not sel_u %}selected{% endif %}>Scegli utente...</option>
+                    {% for u in utenti %}
+                        <option value="{{ u }}" {% if u == sel_u %}selected{% endif %}>{{ u }}</option>
+                    {% endfor %}
+                </select>
+            </form>
+        </div>
+
+        <div class="session-grid">
+            {% for sess, data_list in report.items() %}
+            <div class="card">
+                <h2>Sessione {{ sess }}</h2>
+                {% if data_list %}
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Sensore</th>
+                            <th>Media</th>
+                            <th>Min</th>
+                            <th>Max</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for s in data_list %}
+                        <tr>
+                            <td class="sensor-name">{{ s.sensor }}</td>
+                            <td class="val-media">{{ s.media }}</td>
+                            <td class="val-min">{{ s.min }}</td>
+                            <td class="val-max">{{ s.max }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+                {% else %}
+                <div class="empty-state">Nessuna rilevazione trovata</div>
+                {% endif %}
+            </div>
+            {% endfor %}
+        </div>
+
+        <a href="/dashboard_admin" class="btn-back">← Torna alla Dashboard</a>
+    </div>
+</body>
+</html>
+'''
