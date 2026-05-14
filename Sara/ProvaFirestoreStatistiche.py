@@ -426,101 +426,91 @@ def statistics_admin():
                         'max': s_max
                     })
 
-    return render_template_string(HTML_STATS_SIMPLE, utenti=lista_utenti, report=report_finale, sel_u=selected_user)
+    return render_template_string(HTML_STATS_TEMPLATE, utenti=lista_utenti, report=report_finale, sel_u=selected_user)
 
-HTML_STATS_SIMPLE = '''
+HTML_STATS_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="it">
 <head>
     <meta charset="UTF-8">
     <title>Admin - Statistiche Sensori</title>
     <style>
-        body { font-family: 'Inter', -apple-system, sans-serif; background: #f0f2f5; color: #1c1e21; padding: 0; margin: 0; }
-        .navbar { background: #1a73e8; color: white; padding: 15px 30px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        .container { max-width: 1100px; margin: 30px auto; padding: 0 20px; }
+        body { font-family: 'Inter', -apple-system, sans-serif; background: #f0f2f5; color: #1c1e21; padding: 40px 20px; margin: 0; }
+        .container { max-width: 1000px; margin: auto; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
+        .user-selector { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); margin-bottom: 30px; }
+        select { padding: 10px 15px; border-radius: 8px; border: 1px solid #ddd; font-size: 16px; min-width: 200px; }
         
-        .user-selector { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); margin-bottom: 30px; display: flex; align-items: center; gap: 15px; }
-        select { padding: 10px 15px; border-radius: 8px; border: 1px solid #ddd; font-size: 16px; min-width: 200px; background: white; }
+        .session-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+        .card { background: white; border-radius: 16px; padding: 25px; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); border-top: 5px solid #1a73e8; }
+        .card h2 { margin-top: 0; color: #1a73e8; font-size: 1.2rem; border-bottom: 1px solid #eee; padding-bottom: 10px; }
         
-        .card { background: white; border-radius: 16px; padding: 25px; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); border-top: 5px solid #1a73e8; margin-bottom: 40px; }
-        .card h2 { margin-top: 0; color: #1a73e8; font-size: 1.3rem; border-bottom: 1px solid #eee; padding-bottom: 15px; margin-bottom: 20px; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th { text-align: left; font-size: 12px; text-transform: uppercase; color: #65676b; padding: 10px 5px; }
+        td { padding: 12px 5px; border-bottom: 1px solid #f0f2f5; font-size: 15px; }
         
-        table { width: 100%; border-collapse: collapse; table-layout: fixed; }
-        th, td { padding: 12px; border: 1px solid #edf2f7; text-align: center; font-size: 14px; }
-        th { background: #f8fafc; color: #64748b; text-transform: uppercase; font-size: 12px; letter-spacing: 0.05em; }
+        .sensor-name { font-weight: 600; color: #4b4b4b; }
+        .val-media { font-weight: bold; color: #1a73e8; }
+        .val-min { color: #2ecc71; font-size: 0.9em; }
+        .val-max { color: #e74c3c; font-size: 0.9em; }
         
-        .row-label { background: #f8fafc; font-weight: bold; color: #1e293b; text-align: left; width: 120px; }
-        .val-media { font-weight: bold; color: #1a73e8; font-size: 1.1rem; }
-        .val-min { color: #10b981; }
-        .val-max { color: #ef4444; }
-        
-        .btn-back { color: white; text-decoration: none; background: rgba(255,255,255,0.2); padding: 8px 15px; border-radius: 6px; font-size: 14px; }
-        .empty-state { text-align: center; color: #94a3b8; padding: 40px; font-style: italic; background: white; border-radius: 12px; }
+        .empty-state { text-align: center; color: #8e8e8e; padding: 20px; font-style: italic; }
+        .btn-back { display: inline-block; margin-top: 30px; text-decoration: none; color: #65676b; transition: 0.2s; }
+        .btn-back:hover { color: #1a73e8; }
     </style>
 </head>
 <body>
-    <div class="navbar">
-        <h2 style="margin:0; font-size: 1.5rem;">Statistiche Empatica E4</h2>
-        <a href="/dashboard_admin" class="btn-back">← Dashboard</a>
-    </div>
-
     <div class="container">
+        <div class="header">
+            <h1>Statistiche Settimanali</h1>
+            <span style="background: #1a73e8; color: white; padding: 5px 12px; border-radius: 20px; font-size: 14px;">Admin Mode</span>
+        </div>
+
         <div class="user-selector">
-            <form method="get" style="display: flex; align-items: center; gap: 15px;">
-                <label for="u"><b>Utente:</b></label>
+            <form method="get">
+                <label for="u" style="display: block; margin-bottom: 10px; font-weight: bold;">Seleziona un utente per visualizzare i dati:</label>
                 <select name="u" id="u" onchange="this.form.submit()">
+                    <option value="" disabled {% if not sel_u %}selected{% endif %}>Scegli utente...</option>
                     {% for u in utenti %}
                         <option value="{{ u }}" {% if u == sel_u %}selected{% endif %}>{{ u }}</option>
                     {% endfor %}
                 </select>
             </form>
-            <span style="margin-left: auto; color: #64748b; font-size: 0.85rem;">Range: 7 giorni dall'ultima rilevazione della sessione</span>
         </div>
 
-        {% if report %}
+        <div class="session-grid">
             {% for sess, data_list in report.items() %}
             <div class="card">
-                <h2>Sessione: {{ sess }}</h2>
-                
+                <h2>Sessione {{ sess }}</h2>
                 {% if data_list %}
                 <table>
                     <thead>
                         <tr>
-                            <th>Statistica</th>
-                            {% for item in data_list %}
-                                <th>{{ item.sensor }}</th>
-                            {% endfor %}
+                            <th>Sensore</th>
+                            <th>Media</th>
+                            <th>Min</th>
+                            <th>Max</th>
                         </tr>
                     </thead>
                     <tbody>
+                        {% for s in data_list %}
                         <tr>
-                            <td class="row-label">Media</td>
-                            {% for item in data_list %}
-                                <td class="val-media">{{ item.media }}</td>
-                            {% endfor %}
+                            <td class="sensor-name">{{ s.sensor }}</td>
+                            <td class="val-media">{{ s.media }}</td>
+                            <td class="val-min">{{ s.min }}</td>
+                            <td class="val-max">{{ s.max }}</td>
                         </tr>
-                        <tr>
-                            <td class="row-label">Minimo</td>
-                            {% for item in data_list %}
-                                <td class="val-min">{{ item.min }}</td>
-                            {% endfor %}
-                        </tr>
-                        <tr>
-                            <td class="row-label">Massimo</td>
-                            {% for item in data_list %}
-                                <td class="val-max">{{ item.max }}</td>
-                            {% endfor %}
-                        </tr>
+                        {% endfor %}
                     </tbody>
                 </table>
                 {% else %}
-                <div class="empty-state">Nessun dato trovato per questa sessione.</div>
+                <div class="empty-state">Nessuna rilevazione trovata</div>
                 {% endif %}
             </div>
             {% endfor %}
-        {% else %}
-            <div class="empty-state">Nessun utente selezionato o nessun dato presente.</div>
-        {% endif %}
+        </div>
+
+        <a href="/dashboard_admin" class="btn-back">← Torna alla Dashboard</a>
     </div>
 </body>
 </html>
