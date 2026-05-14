@@ -308,213 +308,388 @@ def dashboard():
         print(f"ERRORE FATALE: {e}")
         return f"<h1>Errore di caricamento</h1><p>{e}</p><a href='/logout'>Torna al login</a>"
 
-from dateutil import parser # Assicurati che sia importato in alto
-
-@app.route('/statistics_admin')
+@app.route('/statistics_admin', methods=['GET', 'POST'])
 def statistics_admin():
-    if 'user' not in session or session.get('tipo') != 'admin':
+    # Controllo autenticazione
+    if 'user' not in session:
         return redirect(url_for('login'))
-
-    # 1. Recupero lista utenti unica
-    docs_u = db.collection('dati_sensori').select(['user']).limit(1000).stream()
-    lista_utenti = sorted(list(set([d.to_dict().get('user') for d in docs_u if d.to_dict().get('user')])))
     
-    selected_user = request.args.get('u')
-    if not selected_user and lista_utenti:
-        selected_user = lista_utenti[0]
-
-    report_finale = {} 
-
-    if selected_user:
-        # 2. Recupero dinamico delle sessioni dell'utente (per non saltarne nessuna)
-        docs_s = db.collection('dati_sensori').where('user', '==', selected_user).select(['session']).stream()
-        elenco_sessioni = sorted(list(set([d.to_dict().get('session') for d in docs_s if d.to_dict().get('session')])))
-
-        for sess in elenco_sessioni:
-            report_finale[sess] = []
+    # Parametri URL per filtraggio
+    selected_user = request.args.get('u', '')
+    selected_sess = request.args.get('s', '01')
+    
+    # Determina la settimana di riferimento (default: settimana nel 2021)
+    # Esempio: settimana 1-7 aprile 2021
+    anno_riferimento = request.args.get('anno', '2021')
+    settimana_numero = request.args.get('settimana', '14')  # settimana 14 = inizio aprile
+    
+    # Calcola date inizio/fine basate su anno e numero settimana (2021)
+    try:
+        # Primo giorno dell'anno
+        primo_gennaio = datetime(int(anno_riferimento), 1, 1, tzinfo=timezone(timedelta(hours=2)))
+        # Calcola inizio della settimana richiesta
+        start_date = primo_gennaio + timedelta(days=(int(settimana_numero)-1)*7)
+        end_date = start_date + timedelta(days=7)
+    except:
+        # Fallback: 1-7 aprile 2021
+        start_date = datetime(2021, 4, 1, 0, 0, 0, tzinfo=timezone(timedelta(hours=2)))
+        end_date = datetime(2021, 4, 8, 0, 0, 0, tzinfo=timezone(timedelta(hours=2)))
+        settimana_numero = '14'
+        anno_riferimento = '2021'
+    
+    try:
+        # Recupero lista utenti disponibili
+        docs_u = db.collection('dati_sensori').select(['user']).limit(100).stream()
+        lista_utenti = sorted(list(set([d.to_dict().get('user') for d in docs_u if d.to_dict().get('user')])))
+        
+        if not lista_utenti:
+            lista_utenti = []
+        
+        # Se nessun utente selezionato, prendi il primo
+        if not selected_user and lista_utenti:
+            selected_user = lista_utenti[0]
+        
+        # Verifica se le statistiche per questa settimana/utente/sessione sono già salvate
+        stat_ref = db.collection('statistiche_settimanali').document(f"{selected_user}_{selected_sess}_{anno_riferimento}_{settimana_numero}")
+        stat_doc = stat_ref.get()
+        
+        if stat_doc.exists:
+            # Recupera statistiche salvate
+            stats = stat_doc.to_dict().get('statistiche', {})
+            weekly_summary = stat_doc.to_dict().get('weekly_summary', {})
+            print(f"Statistiche caricate da Firestore (già esistenti)")
+        else:
+            # Calcola nuove statistiche
+            stats = {}
+            sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
             
-            # Cerchiamo l'ultimo timestamp per definire la finestra di 7 giorni
-            query_last = db.collection('dati_sensori')\
-                           .where('user', '==', selected_user)\
-                           .where('session', '==', sess)\
-                           .order_by('timestamp', direction=firestore.Query.DESCENDING)\
-                           .limit(1).get()
-            
-            if not query_last:
-                continue
-                
-            raw_ts = query_last[0].to_dict().get('timestamp')
-            
-            try:
-                # Gestione robusta della data
-                if isinstance(raw_ts, str):
-                    data_fine = parser.parse(raw_ts, fuzzy=True)
-                else:
-                    data_fine = raw_ts
-
-                if data_fine.tzinfo is None:
-                    data_fine = data_fine.replace(tzinfo=pytz.UTC)
-                
-                data_fine = data_fine.replace(microsecond=0)
-                data_inizio = data_fine - timedelta(days=7)
-            except Exception as e:
-                print(f"Errore data per utente {selected_user}: {e}")
-                continue
-
-            sensori_nomi = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
-            
-            for s in sensori_nomi:
-                # Query per il singolo sensore nell'intervallo stabilito
-                docs_sensor = db.collection('dati_sensori')\
-                                 .where('user', '==', selected_user)\
-                                 .where('session', '==', sess)\
-                                 .where('sensor', '==', s)\
-                                 .where('timestamp', '>=', data_inizio)\
-                                 .where('timestamp', '<=', data_fine)\
-                                 .stream()
-
-                valori = []
-                for d in docs_sensor:
-                    v_raw = d.to_dict().get('valori', {})
+            for sensor in sensori:
+                try:
+                    # Query per i dati della settimana specifica (2021)
+                    query = db.collection('dati_sensori')\
+                              .where('user', '==', selected_user)\
+                              .where('sensor', '==', sensor)\
+                              .where('session', '==', selected_sess)\
+                              .where('timestamp', '>=', start_date)\
+                              .where('timestamp', '<', end_date)\
+                              .order_by('timestamp', direction=firestore.Query.ASCENDING)
                     
-                    # Se i valori sono salvati come stringa JSON (capita con alcuni upload)
-                    if isinstance(v_raw, str):
-                        try: v_raw = json.loads(v_raw.replace("'", '"'))
-                        except: continue
-
-                    try:
-                        if s == "ACC":
-                            # Cerca ax, ay, az sia minuscoli che maiuscoli
-                            ax = float(v_raw.get('ax') or v_raw.get('AX') or v_raw.get('x', 0))
-                            ay = float(v_raw.get('ay') or v_raw.get('AY') or v_raw.get('y', 0))
-                            az = float(v_raw.get('az') or v_raw.get('AZ') or v_raw.get('z', 0))
-                            valori.append(math.sqrt(ax**2 + ay**2 + az**2))
-                        else:
-                            # Cerca la chiave del sensore (es. "HR" o "hr")
-                            # Se non la trova, prende il primo valore disponibile nel dizionario
-                            val_found = v_raw.get(s) or v_raw.get(s.lower())
-                            if val_found is None and v_raw:
-                                val_found = next(iter(v_raw.values()))
+                    results = [d.to_dict() for d in query.stream()]
+                    
+                    if results:
+                        values = []
+                        timestamps = []
+                        
+                        for r in results:
+                            val_raw = r.get('valori', '{}')
+                            val = json.loads(val_raw.replace("'", '"')) if isinstance(val_raw, str) else val_raw
+                            ts = r.get('timestamp')
                             
-                            if val_found is not None:
-                                valori.append(float(val_found))
-                    except:
-                        continue
-
-                if valori:
-                    s_media = round(statistics.mean(valori), 2)
-                    s_min = round(min(valori), 2)
-                    s_max = round(max(valori), 2)
-
-                    # Salvataggio/Aggiornamento statistiche
-                    stat_id = f"{selected_user}_{sess}_{s}"
-                    db.collection('statistiche_settimanali').document(stat_id).set({
-                        'user': selected_user,
-                        'session': sess,
-                        'sensor': s,
-                        'media': s_media,
-                        'min': s_min,
-                        'max': s_max,
-                        'data_elaborazione': datetime.now(pytz.UTC),
-                        'intervallo_dati': f"{data_inizio.strftime('%d/%m/%Y')} - {data_fine.strftime('%d/%m/%Y')}"
-                    })
-
-                    report_finale[sess].append({
-                        'sensor': s, 
-                        'media': s_media, 
-                        'min': s_min, 
-                        'max': s_max
-                    })
-
-    return render_template_string(HTML_STATS_TEMPLATE, utenti=lista_utenti, report=report_finale, sel_u=selected_user)
-
-HTML_STATS_TEMPLATE = '''
+                            if sensor == "ACC":
+                                ax = float(val.get('ax', val.get('x', 0)))
+                                ay = float(val.get('ay', val.get('y', 0)))
+                                az = float(val.get('az', val.get('z', 0)))
+                                values.append(round(math.sqrt(ax**2 + ay**2 + az**2), 2))
+                            else:
+                                values.append(float(next(iter(val.values()))))
+                            
+                            if ts:
+                                timestamps.append(ts.strftime('%Y-%m-%d %H:%M:%S') if hasattr(ts, 'strftime') else str(ts))
+                        
+                        if values:
+                            stats[sensor] = {
+                                'media': round(statistics.mean(values), 2),
+                                'mediana': round(statistics.median(values), 2),
+                                'min': round(min(values), 2),
+                                'max': round(max(values), 2),
+                                'dev_std': round(statistics.stdev(values), 2) if len(values) > 1 else 0,
+                                'conteggio': len(values),
+                                'valori_originali': values[-20:],  # ultimi 20 valori
+                                'timestamp_campioni': timestamps[-20:]  # timestamp associati
+                            }
+                        else:
+                            stats[sensor] = {'media': 0, 'mediana': 0, 'min': 0, 'max': 0, 'dev_std': 0, 'conteggio': 0, 'valori_originali': [], 'timestamp_campioni': []}
+                    else:
+                        stats[sensor] = {'media': 0, 'mediana': 0, 'min': 0, 'max': 0, 'dev_std': 0, 'conteggio': 0, 'valori_originali': [], 'timestamp_campioni': []}
+                        
+                except Exception as e:
+                    print(f"Errore statistiche per {sensor}: {e}")
+                    stats[sensor] = {'media': 0, 'mediana': 0, 'min': 0, 'max': 0, 'dev_std': 0, 'conteggio': 0, 'valori_originali': [], 'timestamp_campioni': []}
+            
+            # Calcola statistiche settimanali aggregate
+            weekly_summary = {}
+            for sensor, data in stats.items():
+                if data['conteggio'] > 0:
+                    tendenza = '➡️'
+                    if data['valori_originali'] and len(data['valori_originali']) > 1:
+                        if data['valori_originali'][-1] > data['valori_originali'][0]:
+                            tendenza = '↗️'
+                        elif data['valori_originali'][-1] < data['valori_originali'][0]:
+                            tendenza = '↘️'
+                    
+                    weekly_summary[sensor] = {
+                        'media_settimanale': data['media'],
+                        'tendenza': tendenza
+                    }
+            
+            # SALVA SU FIRESTORE
+            try:
+                stat_ref.set({
+                    'user': selected_user,
+                    'session': selected_sess,
+                    'anno': int(anno_riferimento),
+                    'settimana': int(settimana_numero),
+                    'data_inizio': start_date,
+                    'data_fine': end_date,
+                    'data_calcolo': datetime.now(timezone(timedelta(hours=2))),
+                    'statistiche': stats,
+                    'weekly_summary': weekly_summary,
+                    'totale_campioni': sum([s['conteggio'] for s in stats.values()])
+                })
+                print(f"Statistiche salvate su Firestore per {selected_user} - settimana {settimana_numero}/{anno_riferimento}")
+            except Exception as e:
+                print(f"Errore salvataggio statistiche: {e}")
+        
+        # Periodo formattato per visualizzazione
+        periodo = f"{start_date.strftime('%d/%m/%Y')} - {(end_date - timedelta(days=1)).strftime('%d/%m/%Y')} ({anno_riferimento})"
+        
+    except Exception as e:
+        print(f"ERRORE statistiche: {e}")
+        stats = {}
+        weekly_summary = {}
+        periodo = "Nessun dato disponibile"
+    
+    return render_template_string('''
 <!DOCTYPE html>
 <html lang="it">
 <head>
     <meta charset="UTF-8">
-    <title>Admin - Statistiche Sensori</title>
+    <title>Statistiche Settimanali - Empatica E4</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        body { font-family: 'Inter', -apple-system, sans-serif; background: #f0f2f5; color: #1c1e21; padding: 40px 20px; margin: 0; }
-        .container { max-width: 1000px; margin: auto; }
-        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 30px; }
-        .user-selector { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); margin-bottom: 30px; }
-        select { padding: 10px 15px; border-radius: 8px; border: 1px solid #ddd; font-size: 16px; min-width: 200px; }
-        
-        .session-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
-        .card { background: white; border-radius: 16px; padding: 25px; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); border-top: 5px solid #1a73e8; }
-        .card h2 { margin-top: 0; color: #1a73e8; font-size: 1.2rem; border-bottom: 1px solid #eee; padding-bottom: 10px; }
-        
-        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-        th { text-align: left; font-size: 12px; text-transform: uppercase; color: #65676b; padding: 10px 5px; }
-        td { padding: 12px 5px; border-bottom: 1px solid #f0f2f5; font-size: 15px; }
-        
-        .sensor-name { font-weight: 600; color: #4b4b4b; }
-        .val-media { font-weight: bold; color: #1a73e8; }
-        .val-min { color: #2ecc71; font-size: 0.9em; }
-        .val-max { color: #e74c3c; font-size: 0.9em; }
-        
-        .empty-state { text-align: center; color: #8e8e8e; padding: 20px; font-style: italic; }
-        .btn-back { display: inline-block; margin-top: 30px; text-decoration: none; color: #65676b; transition: 0.2s; }
-        .btn-back:hover { color: #1a73e8; }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f4f7f9; color: #333; }
+        .navbar { background: #1a73e8; color: white; padding: 15px 30px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .navbar h2 { margin: 0; font-size: 1.4rem; }
+        .nav-links a { color: white; text-decoration: none; margin-left: 20px; font-weight: 500; font-size: 0.9rem; }
+        .nav-links a:hover { text-decoration: underline; }
+        .container { max-width: 1300px; margin: 30px auto; padding: 0 20px; }
+        .filters { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.05); margin-bottom: 25px; display: flex; gap: 20px; align-items: center; flex-wrap: wrap; }
+        .filters label { font-weight: 600; color: #555; }
+        select, button { padding: 10px 15px; border-radius: 6px; border: 1px solid #ddd; font-size: 14px; background: white; cursor: pointer; }
+        button { background: #1a73e8; color: white; border: none; font-weight: 600; }
+        button:hover { background: #1557b0; }
+        .period-badge { background: #e8f0fe; color: #1a73e8; padding: 8px 15px; border-radius: 20px; font-size: 0.85rem; font-weight: 500; }
+        .save-badge { background: #28a745; color: white; padding: 5px 12px; border-radius: 20px; font-size: 0.75rem; margin-left: 10px; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 25px; margin-top: 25px; }
+        .stat-card { background: white; border-radius: 12px; padding: 20px; box-shadow: 0 4px 10px rgba(0,0,0,0.08); transition: transform 0.2s; }
+        .stat-card:hover { transform: translateY(-3px); box-shadow: 0 8px 20px rgba(0,0,0,0.12); }
+        .card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; padding-bottom: 10px; border-bottom: 2px solid #e0e0e0; }
+        .card-header h3 { color: #1a73e8; font-size: 1.3rem; }
+        .trend { font-size: 1.2rem; padding: 5px 10px; background: #f0f2f5; border-radius: 20px; }
+        .stats-row { display: flex; justify-content: space-between; margin: 12px 0; padding: 8px 0; border-bottom: 1px solid #f0f0f0; }
+        .stats-label { font-weight: 600; color: #666; }
+        .stats-value { font-weight: 700; color: #1a73e8; font-size: 1.1rem; }
+        .mini-chart { margin-top: 15px; padding-top: 15px; border-top: 1px solid #e0e0e0; }
+        canvas.mini-canvas { max-height: 100px; width: 100%; }
+        .no-data { text-align: center; padding: 40px; color: #999; }
+        .info-text { background: #fff3cd; border-left: 4px solid #ffc107; padding: 12px; margin: 20px 0; border-radius: 6px; font-size: 0.9rem; }
+        .week-selector { display: flex; gap: 10px; align-items: center; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>Statistiche Settimanali</h1>
-            <span style="background: #1a73e8; color: white; padding: 5px 12px; border-radius: 20px; font-size: 14px;">Admin Mode</span>
+    <div class="navbar">
+        <h2>📊 Empatica E4 - Statistiche Settimanali</h2>
+        <div class="nav-links">
+            <a href="/dashboard_admin">Dashboard</a>
+            <a href="/statistics_admin">Statistiche</a>
+            <a href="/register">Nuovo Utente</a>
+            <a href="/logout">Logout</a>
         </div>
+    </div>
 
-        <div class="user-selector">
-            <form method="get">
-                <label for="u" style="display: block; margin-bottom: 10px; font-weight: bold;">Seleziona un utente per visualizzare i dati:</label>
-                <select name="u" id="u" onchange="this.form.submit()">
-                    <option value="" disabled {% if not sel_u %}selected{% endif %}>Scegli utente...</option>
+    <div class="container">
+        <div class="filters">
+            <div>
+                <label>👤 Utente:</label>
+                <select id="userSelect" onchange="updateFilters()">
                     {% for u in utenti %}
-                        <option value="{{ u }}" {% if u == sel_u %}selected{% endif %}>{{ u }}</option>
+                    <option value="{{ u }}" {% if u == selected_user %}selected{% endif %}>{{ u }}</option>
                     {% endfor %}
                 </select>
-            </form>
+            </div>
+            <div>
+                <label>🎮 Sessione:</label>
+                <select id="sessSelect" onchange="updateFilters()">
+                    <option value="01" {% if selected_sess == '01' %}selected{% endif %}>01</option>
+                    <option value="02" {% if selected_sess == '02' %}selected{% endif %}>02</option>
+                    <option value="03" {% if selected_sess == '03' %}selected{% endif %}>03</option>
+                </select>
+            </div>
+            <div class="week-selector">
+                <label>📅 Anno:</label>
+                <select id="annoSelect" onchange="updateFilters()">
+                    <option value="2021" {% if anno == '2021' %}selected{% endif %}>2021</option>
+                </select>
+            </div>
+            <div class="week-selector">
+                <label>🗓️ Settimana:</label>
+                <select id="settimanaSelect" onchange="updateFilters()">
+                    {% for w in range(1, 53) %}
+                    <option value="{{ w }}" {% if settimana|string == w|string %}selected{% endif %}>Settimana {{ w }} ({{ (datetime(2021,1,1, tzinfo=timezone(timedelta(hours=2))) + timedelta(days=(w-1)*7)).strftime('%d/%m') }} - {{ (datetime(2021,1,1, tzinfo=timezone(timedelta(hours=2))) + timedelta(days=w*7-1)).strftime('%d/%m') }})</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="period-badge">
+                📅 {{ periodo }}
+            </div>
         </div>
 
-        <div class="session-grid">
-            {% for sess, data_list in report.items() %}
-            <div class="card">
-                <h2>Sessione {{ sess }}</h2>
-                {% if data_list %}
-                <table>
-                    <thead>
-                        <tr>
-                            <th>Sensore</th>
-                            <th>Media</th>
-                            <th>Min</th>
-                            <th>Max</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for s in data_list %}
-                        <tr>
-                            <td class="sensor-name">{{ s.sensor }}</td>
-                            <td class="val-media">{{ s.media }}</td>
-                            <td class="val-min">{{ s.min }}</td>
-                            <td class="val-max">{{ s.max }}</td>
-                        </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
-                {% else %}
-                <div class="empty-state">Nessuna rilevazione trovata</div>
+        {% if utenti %}
+        <div class="stats-grid">
+            {% for sensor, data in stats.items() %}
+            <div class="stat-card">
+                <div class="card-header">
+                    <h3>
+                        {% if sensor == "ACC" %}📳 Accelerometro
+                        {% elif sensor == "BVP" %}❤️ BVP
+                        {% elif sensor == "EDA" %}⚡ EDA
+                        {% elif sensor == "HR" %}💓 Frequenza Cardiaca
+                        {% elif sensor == "IBI" %}⏱️ IBI
+                        {% elif sensor == "TEMP" %}🌡️ Temperatura
+                        {% else %}{{ sensor }}
+                        {% endif %}
+                    </h3>
+                    <span class="trend">{{ weekly_summary[sensor]['tendenza'] if weekly_summary.get(sensor) else '➡️' }}</span>
+                </div>
+                
+                <div class="stats-row">
+                    <span class="stats-label">📈 Media settimanale:</span>
+                    <span class="stats-value">{{ data.media }} 
+                        {% if sensor == "TEMP" %}°C
+                        {% elif sensor == "HR" %}bpm
+                        {% elif sensor == "ACC" %}mg
+                        {% elif sensor == "EDA" %}μS
+                        {% elif sensor == "IBI" %}ms
+                        {% endif %}
+                    </span>
+                </div>
+                
+                <div class="stats-row">
+                    <span class="stats-label">📊 Mediana:</span>
+                    <span class="stats-value">{{ data.mediana }}</span>
+                </div>
+                
+                <div class="stats-row">
+                    <span class="stats-label">🔽 Minimo:</span>
+                    <span class="stats-value">{{ data.min }}</span>
+                </div>
+                
+                <div class="stats-row">
+                    <span class="stats-label">🔼 Massimo:</span>
+                    <span class="stats-value">{{ data.max }}</span>
+                </div>
+                
+                <div class="stats-row">
+                    <span class="stats-label">📐 Deviazione Std:</span>
+                    <span class="stats-value">{{ data.dev_std }}</span>
+                </div>
+                
+                <div class="stats-row">
+                    <span class="stats-label">🔢 Numero campioni:</span>
+                    <span class="stats-value">{{ data.conteggio }}</span>
+                </div>
+                
+                {% if data.valori_originali and data.valori_originali|length > 1 %}
+                <div class="mini-chart">
+                    <canvas id="chart_{{ loop.index }}" class="mini-canvas"></canvas>
+                </div>
                 {% endif %}
             </div>
             {% endfor %}
         </div>
-
-        <a href="/dashboard_admin" class="btn-back">← Torna alla Dashboard</a>
+        
+        <div class="info-text">
+            💡 <strong>Info:</strong> Le statistiche si riferiscono ai dati della settimana selezionata nell'anno 2021. 
+            Le statistiche vengono automaticamente salvate su Firestore nella collezione 'statistiche_settimanali' per evitare ricalcoli.
+            La tendenza (↗️/↘️/➡️) indica la variazione tra il primo e l'ultimo valore della settimana.
+        </div>
+        {% else %}
+        <div class="no-data">
+            <h3>⚠️ Nessun dato disponibile</h3>
+            <p>Non ci sono utenti o dati registrati nel sistema.</p>
+        </div>
+        {% endif %}
     </div>
+
+    <script>
+        const allStats = {{ stats|tojson }};
+        const sensorNames = {
+            "ACC": "Accelerometro",
+            "BVP": "BVP",
+            "EDA": "EDA", 
+            "HR": "Frequenza Cardiaca",
+            "IBI": "IBI",
+            "TEMP": "Temperatura"
+        };
+        
+        // Inizializza mini-grafici
+        window.onload = function() {
+            let chartIndex = 1;
+            for (const [sensor, data] of Object.entries(allStats)) {
+                if (data.valori_originali && data.valori_originali.length > 1) {
+                    const canvasId = `chart_${chartIndex}`;
+                    const canvas = document.getElementById(canvasId);
+                    if (canvas) {
+                        const ctx = canvas.getContext('2d');
+                        new Chart(ctx, {
+                            type: 'line',
+                            data: {
+                                labels: data.valori_originali.map((_, i) => i+1),
+                                datasets: [{
+                                    label: sensorNames[sensor] || sensor,
+                                    data: data.valori_originali,
+                                    borderColor: '#1a73e8',
+                                    backgroundColor: 'rgba(26, 115, 232, 0.1)',
+                                    borderWidth: 2,
+                                    fill: true,
+                                    pointRadius: 2,
+                                    tension: 0.3
+                                }]
+                            },
+                            options: {
+                                responsive: true,
+                                maintainAspectRatio: true,
+                                plugins: {
+                                    legend: { display: false },
+                                    tooltip: { enabled: false }
+                                },
+                                scales: {
+                                    x: { display: false },
+                                    y: { display: false }
+                                }
+                            }
+                        });
+                    }
+                }
+                chartIndex++;
+            }
+        };
+        
+        function updateFilters() {
+            const user = document.getElementById('userSelect').value;
+            const sess = document.getElementById('sessSelect').value;
+            const anno = document.getElementById('annoSelect').value;
+            const settimana = document.getElementById('settimanaSelect').value;
+            window.location.href = `/statistics_admin?u=${user}&s=${sess}&anno=${anno}&settimana=${settimana}`;
+        }
+    </script>
 </body>
 </html>
-'''
+    ''', utenti=lista_utenti, selected_user=selected_user, selected_sess=selected_sess,
+        stats=stats, weekly_summary=weekly_summary, periodo=periodo,
+        anno=anno_riferimento, settimana=settimana_numero, datetime=datetime, 
+        timezone=timezone, timedelta=timedelta)
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
