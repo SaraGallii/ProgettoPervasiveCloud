@@ -102,52 +102,65 @@ def logout():
     session.clear()
     return redirect(url_for('login'))
 
-# --- ROTTA API PER L'ULTIMO DATO IN TEMPO REALE (SOLO UTENTI REGISTRATI) ---
+# --- ROTTA API LIVE_DATA SENZA INDICI ---
 @app.route('/api/live_data')
 def api_live_data():
     if 'user' not in session or session.get('tipo') != 'admin':
         return jsonify({"status": "error", "message": "Accesso negato"}), 403
         
     try:
-        # 1. Recuperiamo tutti gli id_utente validi dalla collezione 'utenti'
+        # 1. Recuperiamo gli id_utente registrati
         docs_utenti = db.collection('utenti').stream()
-        id_validi = [d.to_dict().get('id_utente') for d in docs_utenti if d.to_dict().get('id_utente')]
-        
-        # Se non ci sono utenti registrati nel sistema, ci fermiamo subito
-        if not id_validi:
-            return jsonify({"message": "Nessun utente registrato nel database"}), 404
-
-        # Nota: L'operatore 'in' di Firestore supporta liste fino a 30 elementi.
-        # Se hai più di 30 utenti, usa le prime 30 posizioni: id_validi[:30]
-        
-        # 2. Interroghiamo i dati sensori filtrando SOLO per gli ID utenti registrati
-        query = db.collection('dati_sensori')\
-                  .where('user', 'in', id_validi)\
-                  .order_by('data_ricezione', direction=firestore.Query.DESCENDING)\
-                  .limit(1)
-        
-        results = [d.to_dict() for d in query.stream()]
-        
-        if results:
-            ultimo_dato = results[0]
+        id_validi = set()
+        for d in docs_utenti:
+            u_data = d.to_dict()
+            id_u = u_data.get('id_utente')
+            if id_u:
+                id_validi.add(str(id_u).strip())
+            id_validi.add(str(d.id).strip()) # Sicurezza sul nome del documento
             
-            ts = ultimo_dato.get('timestamp')
-            ts_millisecondi = int(ts.timestamp() * 1000) if hasattr(ts, 'timestamp') else str(ts)
+        if not id_validi:
+            return jsonify({"message": "Nessun utente registrato nel DB"}), 404
+
+        # 2. Query semplice (Usa solo l'ordinamento, QUINDI NO INDICI COMPOSITI)
+        # Recuperiamo gli ultimi 50 record arrivati in assoluto
+        query = db.collection('dati_sensori')\
+                  .order_by('data_ricezione', direction=firestore.Query.DESCENDING)\
+                  .limit(50)
+        
+        # 3. Filtriamo in Python anziché farlo fare a Firestore
+        ultimo_dato_valido = None
+        for doc in query.stream():
+            dati_doc = doc.to_dict()
+            user_del_dato = str(dati_doc.get('user', '')).strip()
+            
+            # Se l'utente che ha inviato questo dato fa parte di quelli registrati, abbiamo fatto centro!
+            if user_del_dato in id_validi:
+                ultimo_dato_valido = dati_doc
+                break # Ci fermiamo al primo (che è il più recente in assoluto)
+
+        if ultimo_dato_valido:
+            ts = ultimo_dato_valido.get('timestamp')
+            if ts and hasattr(ts, 'timestamp'):
+                ts_millisecondi = int(ts.timestamp() * 1000)
+            elif isinstance(ts, (int, float)):
+                ts_millisecondi = int(ts) if ts > 9999999999 else int(ts * 1000)
+            else:
+                ts_millisecondi = str(ts)
             
             return jsonify({
-                "utente": ultimo_dato.get('user', 'N/D'),
-                "sessione": ultimo_dato.get('session', 'N/D'),
-                "sensore": ultimo_dato.get('sensor', 'N/D'),
+                "utente": ultimo_dato_valido.get('user', 'N/D'),
+                "sessione": ultimo_dato_valido.get('session', 'N/D'),
+                "sensore": ultimo_dato_valido.get('sensor', 'N/D'),
                 "orario": ts_millisecondi,
-                "valori": ultimo_dato.get('valori', {})
+                "valori": ultimo_dato_valido.get('valori', {})
             })
         else:
-            return jsonify({"message": "Nessun dato trovato per gli utenti registrati"}), 404
+            return jsonify({"message": "Nessun dato recente per gli utenti registrati"}), 404
             
     except Exception as e:
-        print(f"Errore API live data filtrata: {e}")
-        return jsonify({"status": "error"}), 500
-
+        print(f"Errore Live Data Software-Filtered: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 # --- ROTTA PAGINA LIVE DATA (INTERFACCIA GRAFICA) ---
 @app.route('/live_admin')
