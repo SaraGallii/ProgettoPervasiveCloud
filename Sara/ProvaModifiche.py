@@ -169,7 +169,9 @@ HTML_LIVE_DATA = '''
         .label { width: 180px; font-weight: bold; color: #555; }
         .value { font-weight: 500; color: #000; }
         .value.sensor { color: #d93025; font-weight: bold; } /* Colore rosso per il sensore come in foto */
-        .value.json { font-family: 'Courier New', Courier, monospace; background: #f8f9fa; padding: 8px 12px; border-radius: 6px; border: 1px solid #eee; }
+        
+        /* Modificato per ospitare i badge estetici senza sfondi grigi ereditati */
+        .value.json { font-family: sans-serif; background: transparent; padding: 0; border: none; }
         
         .footer-status { margin-top: 40px; color: #888; font-size: 0.9rem; font-style: italic; display: flex; align-items: center; gap: 8px; }
         .dot { width: 8px; height: 8px; background-color: #34a853; border-radius: 50%; display: inline-block; animation: blink 1.5s infinite; }
@@ -224,6 +226,42 @@ HTML_LIVE_DATA = '''
     </div>
 
     <script>
+        function formattaOrario(timestampMillisecondi) {
+            if (!timestampMillisecondi || isNaN(timestampMillisecondi)) return "--:--:--";
+            const data = new Date(Number(timestampMillisecondi));
+            
+            const ore = String(data.getHours()).padStart(2, '0');
+            const minuti = String(data.getMinutes()).padStart(2, '0');
+            const secondi = String(data.getSeconds()).padStart(2, '0');
+            
+            return `${ore}:${minuti}:${secondi}`;
+        }
+
+        function generaBadgeDati(valori) {
+            if (!valori || typeof valori !== 'object' || Object.keys(valori).length === 0) return '{}';
+            
+            let htmlBadges = '<div style="display: flex; gap: 10px; flex-wrap: wrap;">';
+            
+            for (const [chiave, valore] of Object.entries(valori)) {
+                htmlBadges += `
+                    <span style="
+                        background: #e8f0fe; 
+                        color: #1a73e8; 
+                        padding: 6px 14px; 
+                        border-radius: 20px; 
+                        font-weight: 600; 
+                        font-size: 0.95rem;
+                        border: 1px solid #c2dbff;
+                        font-family: sans-serif;
+                    ">
+                        <strong style="color: #555; margin-right: 4px;">${chiave}:</strong>${valore}
+                    </span>`;
+            }
+            
+            htmlBadges += '</div>';
+            return htmlBadges;
+        }
+
         function caricaDatoRealTime() {
             fetch('/api/live_data')
                 .then(response => response.json())
@@ -232,11 +270,12 @@ HTML_LIVE_DATA = '''
                         document.getElementById('lblUtente').innerText = data.utente;
                         document.getElementById('lblSessione').innerText = data.sessione;
                         document.getElementById('lblSensore').innerText = data.sensore;
-                        document.getElementById('lblOrario').innerText = data.orario;
                         
-                        // Formatta il dizionario/JSON in linea usando i singoli apici per i campi per matchare lo screen
-                        let jsonStr = JSON.stringify(data.valori).replace(/"/g, "'");
-                        document.getElementById('lblDati').innerText = jsonStr;
+                        // 1. Stampa l'orario convertito in formato HH:MM:SS
+                        document.getElementById('lblOrario').innerText = formattaOrario(data.orario);
+                        
+                        // 2. Stampa i dati formattati in badge eleganti anziché stringhe
+                        document.getElementById('lblDati').innerHTML = generaBadgeDati(data.valori);
                     }
                 })
                 .catch(err => console.error("Errore fetch dati live:", err));
