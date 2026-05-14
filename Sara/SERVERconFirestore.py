@@ -102,6 +102,216 @@ def logout():
     session.clear()
     return redirect(url_for('login'))
 
+# --- ROTTA API LIVE_DATA SENZA INDICI ---
+@app.route('/api/live_data')
+def api_live_data():
+    if 'user' not in session or session.get('tipo') != 'admin':
+        return jsonify({"status": "error", "message": "Accesso negato"}), 403
+        
+    try:
+        # 1. Recuperiamo gli id_utente registrati
+        docs_utenti = db.collection('utenti').stream()
+        id_validi = set()
+        for d in docs_utenti:
+            u_data = d.to_dict()
+            id_u = u_data.get('id_utente')
+            if id_u:
+                id_validi.add(str(id_u).strip())
+            id_validi.add(str(d.id).strip()) # Sicurezza sul nome del documento
+            
+        if not id_validi:
+            return jsonify({"message": "Nessun utente registrato nel DB"}), 404
+
+        # 2. Query semplice (Usa solo l'ordinamento, QUINDI NO INDICI COMPOSITI)
+        # Recuperiamo gli ultimi 50 record arrivati in assoluto
+        query = db.collection('dati_sensori')\
+                  .order_by('data_ricezione', direction=firestore.Query.DESCENDING)\
+                  .limit(50)
+        
+        # 3. Filtriamo in Python anziché farlo fare a Firestore
+        ultimo_dato_valido = None
+        for doc in query.stream():
+            dati_doc = doc.to_dict()
+            user_del_dato = str(dati_doc.get('user', '')).strip()
+            
+            # Se l'utente che ha inviato questo dato fa parte di quelli registrati, abbiamo fatto centro!
+            if user_del_dato in id_validi:
+                ultimo_dato_valido = dati_doc
+                break # Ci fermiamo al primo (che è il più recente in assoluto)
+
+        if ultimo_dato_valido:
+            ts = ultimo_dato_valido.get('timestamp')
+            if ts and hasattr(ts, 'timestamp'):
+                ts_millisecondi = int(ts.timestamp() * 1000)
+            elif isinstance(ts, (int, float)):
+                ts_millisecondi = int(ts) if ts > 9999999999 else int(ts * 1000)
+            else:
+                ts_millisecondi = str(ts)
+            
+            return jsonify({
+                "utente": ultimo_dato_valido.get('user', 'N/D'),
+                "sessione": ultimo_dato_valido.get('session', 'N/D'),
+                "sensore": ultimo_dato_valido.get('sensor', 'N/D'),
+                "orario": ts_millisecondi,
+                "valori": ultimo_dato_valido.get('valori', {})
+            })
+        else:
+            return jsonify({"message": "Nessun dato recente per gli utenti registrati"}), 404
+            
+    except Exception as e:
+        print(f"Errore Live Data Software-Filtered: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# --- ROTTA PAGINA LIVE DATA (INTERFACCIA GRAFICA) ---
+@app.route('/live_admin')
+def live_admin():
+    if 'user' not in session or session.get('tipo') != 'admin':
+        return redirect(url_for('login'))
+        
+    return render_template_string(HTML_LIVE_DATA)
+
+# --- TEMPLATE SCHERMATA DATI IN TEMPO REALE ---
+HTML_LIVE_DATA = '''
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <title>Empatica E4 - Live Data</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f4f7f9; margin: 0; color: #333; }
+        .navbar { background: #1a73e8; color: white; padding: 15px 30px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .nav-links a { color: white; text-decoration: none; margin-left: 20px; font-weight: 500; font-size: 0.9rem; }
+        .nav-links a:hover { text-decoration: underline; }
+        
+        .container { max-width: 900px; margin: 50px auto; padding: 0 20px; }
+        .live-card { background: white; padding: 40px; border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.05); }
+        
+        h1 { color: #1a73e8; font-size: 2.5rem; margin-top: 0; margin-bottom: 30px; border-bottom: 2px solid #e8f0fe; padding-bottom: 15px; }
+        
+        .row { display: flex; margin-bottom: 25px; font-size: 1.2rem; align-items: center; }
+        .label { width: 180px; font-weight: bold; color: #555; }
+        .value { font-weight: 500; color: #000; }
+        .value.sensor { color: #d93025; font-weight: bold; } /* Colore rosso per il sensore come in foto */
+        
+        /* Modificato per ospitare i badge estetici senza sfondi grigi ereditati */
+        .value.json { font-family: sans-serif; background: transparent; padding: 0; border: none; }
+        
+        .footer-status { margin-top: 40px; color: #888; font-size: 0.9rem; font-style: italic; display: flex; align-items: center; gap: 8px; }
+        .dot { width: 8px; height: 8px; background-color: #34a853; border-radius: 50%; display: inline-block; animation: blink 1.5s infinite; }
+        
+        @keyframes blink { 0% { opacity: 0.3; } 50% { opacity: 1; } 100% { opacity: 0.3; } }
+    </style>
+</head>
+<body>
+    <div class="navbar">
+        <h2 style="margin:0; font-size: 1.4rem;">Empatica E4 Dashboard</h2>
+        <div class="nav-links">
+            <a href="/dashboard_admin">Dashboard</a>
+            <a href="/live_admin" style="text-decoration: underline;">Dati in tempo reale</a>
+            <a href="/register">Nuovo Utente</a>
+            <a href="/logout" style="color: #ffcccc;">Logout</a>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="live-card">
+            <h1>Empatica E4 wristband</h1>
+            
+            <div class="row">
+                <div class="label">Utente:</div>
+                <div class="value" id="lblUtente">--</div>
+            </div>
+            
+            <div class="row">
+                <div class="label">Sessione:</div>
+                <div class="value" id="lblSessione">--</div>
+            </div>
+            
+            <div class="row">
+                <div class="label">Sensore:</div>
+                <div class="value sensor" id="lblSensore">--</div>
+            </div>
+            
+            <div class="row">
+                <div class="label">Orario:</div>
+                <div class="value" id="lblOrario">--</div>
+            </div>
+            
+            <div class="row" style="align-items: flex-start;">
+                <div class="label" style="margin-top: 8px;">Dati ricevuti:</div>
+                <div class="value json" id="lblDati">{}</div>
+            </div>
+            
+            <div class="footer-status">
+                <span class="dot"></span> Aggiornamento automatico attivo...
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function formattaOrario(timestampMillisecondi) {
+            if (!timestampMillisecondi || isNaN(timestampMillisecondi)) return "--:--:--";
+            const data = new Date(Number(timestampMillisecondi));
+            
+            const ore = String(data.getHours()).padStart(2, '0');
+            const minuti = String(data.getMinutes()).padStart(2, '0');
+            const secondi = String(data.getSeconds()).padStart(2, '0');
+            
+            return `${ore}:${minuti}:${secondi}`;
+        }
+
+        function generaBadgeDati(valori) {
+            if (!valori || typeof valori !== 'object' || Object.keys(valori).length === 0) return '{}';
+            
+            let htmlBadges = '<div style="display: flex; gap: 10px; flex-wrap: wrap;">';
+            
+            for (const [chiave, valore] of Object.entries(valori)) {
+                htmlBadges += `
+                    <span style="
+                        background: #e8f0fe; 
+                        color: #1a73e8; 
+                        padding: 6px 14px; 
+                        border-radius: 20px; 
+                        font-weight: 600; 
+                        font-size: 0.95rem;
+                        border: 1px solid #c2dbff;
+                        font-family: sans-serif;
+                    ">
+                        <strong style="color: #555; margin-right: 4px;">${chiave}:</strong>${valore}
+                    </span>`;
+            }
+            
+            htmlBadges += '</div>';
+            return htmlBadges;
+        }
+
+        function caricaDatoRealTime() {
+            fetch('/api/live_data')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status !== "error" && !data.message) {
+                        document.getElementById('lblUtente').innerText = data.utente;
+                        document.getElementById('lblSessione').innerText = data.sessione;
+                        document.getElementById('lblSensore').innerText = data.sensore;
+                        
+                        // 1. Stampa l'orario convertito in formato HH:MM:SS
+                        document.getElementById('lblOrario').innerText = formattaOrario(data.orario);
+                        
+                        // 2. Stampa i dati formattati in badge eleganti anziché stringhe
+                        document.getElementById('lblDati').innerHTML = generaBadgeDati(data.valori);
+                    }
+                })
+                .catch(err => console.error("Errore fetch dati live:", err));
+        }
+
+        // Esegue il fetch subito all'avvio e poi ogni 1000 millisecondi (1 secondo)
+        caricaDatoRealTime();
+        setInterval(caricaDatoRealTime, 1000);
+    </script>
+</body>
+</html>
+'''
+
 @app.route('/dashboard_admin')
 def dashboard():
     if 'user' not in session or session.get('tipo') != 'admin':
@@ -263,6 +473,7 @@ HTML_DASHBOARD_ORIGINALE = '''
         <div class="nav-links">
             {% if session['tipo'] == 'admin' %}
                 <a href="/dashboard_admin">Dashboard</a>
+                <a href="/live_admin">Dati in tempo reale</a>
                 <a href="/statistics_admin">Statistiche</a>
                 <a href="/register">Nuovo Utente</a>
             {% else %}
