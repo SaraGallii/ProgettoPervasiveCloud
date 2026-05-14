@@ -433,92 +433,93 @@ HTML_STATS_SIMPLE = '''
 <html lang="it">
 <head>
     <meta charset="UTF-8">
-    <title>Report Statistiche Settimanali</title>
+    <title>Admin - Statistiche Sensori</title>
     <style>
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f0f2f5; margin: 0; color: #1c1e21; }
+        body { font-family: 'Inter', -apple-system, sans-serif; background: #f0f2f5; color: #1c1e21; padding: 0; margin: 0; }
         .navbar { background: #1a73e8; color: white; padding: 15px 30px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        .container { max-width: 1100px; margin: 20px auto; padding: 20px; }
-        .card { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); margin-bottom: 30px; }
+        .container { max-width: 1100px; margin: 30px auto; padding: 0 20px; }
         
-        .controls { margin-bottom: 20px; display: flex; gap: 15px; background: white; padding: 15px; border-radius: 8px; align-items: center; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-        select { padding: 8px 12px; border-radius: 5px; border: 1px solid #ddd; background: white; font-size: 14px; min-width: 200px; }
+        .user-selector { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); margin-bottom: 30px; display: flex; align-items: center; gap: 15px; }
+        select { padding: 10px 15px; border-radius: 8px; border: 1px solid #ddd; font-size: 16px; min-width: 200px; background: white; }
         
-        h2.session-title { color: #1a73e8; margin-top: 0; border-bottom: 2px solid #f0f2f5; padding-bottom: 10px; display: flex; justify-content: space-between; align-items: center; }
-        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-        th, td { padding: 14px; border-bottom: 1px solid #eee; text-align: center; }
-        th { background: #f8f9fa; color: #1a73e8; font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.5px; }
+        .card { background: white; border-radius: 16px; padding: 25px; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); border-top: 5px solid #1a73e8; margin-bottom: 40px; }
+        .card h2 { margin-top: 0; color: #1a73e8; font-size: 1.3rem; border-bottom: 1px solid #eee; padding-bottom: 15px; margin-bottom: 20px; }
         
-        .highlight { font-weight: bold; color: #4b4b4b; text-align: left; }
+        table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+        th, td { padding: 12px; border: 1px solid #edf2f7; text-align: center; font-size: 14px; }
+        th { background: #f8fafc; color: #64748b; text-transform: uppercase; font-size: 12px; letter-spacing: 0.05em; }
+        
+        .row-label { background: #f8fafc; font-weight: bold; color: #1e293b; text-align: left; width: 120px; }
         .val-media { font-weight: bold; color: #1a73e8; font-size: 1.1rem; }
-        .val-min { color: #2ecc71; }
-        .val-max { color: #e74c3c; }
+        .val-min { color: #10b981; }
+        .val-max { color: #ef4444; }
         
-        .btn-back { color:white; text-decoration:none; background:rgba(255,255,255,0.2); padding:8px 15px; border-radius:5px; transition: 0.3s; }
-        .btn-back:hover { background:rgba(255,255,255,0.3); }
-        .range-badge { background: #e6fffa; color: #00875a; padding: 5px 12px; border-radius: 20px; font-size: 0.75rem; border: 1px solid #b2f5ea; }
-        .empty-state { text-align: center; color: #8e8e8e; padding: 20px; font-style: italic; }
+        .btn-back { color: white; text-decoration: none; background: rgba(255,255,255,0.2); padding: 8px 15px; border-radius: 6px; font-size: 14px; }
+        .empty-state { text-align: center; color: #94a3b8; padding: 40px; font-style: italic; background: white; border-radius: 12px; }
     </style>
 </head>
 <body>
     <div class="navbar">
-        <h2 style="margin:0;">Report Settimanale Empatica E4</h2>
-        <a href="/dashboard_admin" class="btn-back">← Torna alla Dashboard</a>
+        <h2 style="margin:0; font-size: 1.5rem;">Statistiche Empatica E4</h2>
+        <a href="/dashboard_admin" class="btn-back">← Dashboard</a>
     </div>
 
     <div class="container">
-        <div class="controls">
-            <form method="get" style="display: flex; align-items: center; gap: 15px; width: 100%;">
-                <label><b>Seleziona Utente:</b></label>
-                <select name="u" onchange="this.form.submit()">
-                    <option value="" disabled {% if not sel_u %}selected{% endif %}>Scegli...</option>
+        <div class="user-selector">
+            <form method="get" style="display: flex; align-items: center; gap: 15px;">
+                <label for="u"><b>Utente:</b></label>
+                <select name="u" id="u" onchange="this.form.submit()">
                     {% for u in utenti %}
-                        <option value="{{ u }}" {% if u == sel_u %}selected{% endif %}>Utente {{ u }}</option>
+                        <option value="{{ u }}" {% if u == sel_u %}selected{% endif %}>{{ u }}</option>
                     {% endfor %}
                 </select>
-                <span style="margin-left:auto; color: #666; font-size: 0.8rem;">Analisi basata sugli ultimi 7 giorni di ogni sessione</span>
             </form>
+            <span style="margin-left: auto; color: #64748b; font-size: 0.85rem;">Range: 7 giorni dall'ultima rilevazione della sessione</span>
         </div>
 
         {% if report %}
             {% for sess, data_list in report.items() %}
             <div class="card">
-                <div class="session-title">
-                    <span>Sessione: {{ sess }}</span>
-                    {% if data_list %}
-                        <span class="range-badge">Parametri Riassuntivi</span>
-                    {% endif %}
-                </div>
-
+                <h2>Sessione: {{ sess }}</h2>
+                
                 {% if data_list %}
                 <table>
                     <thead>
                         <tr>
-                            <th style="text-align: left;">Sensore</th>
-                            <th>Media</th>
-                            <th>Minimo</th>
-                            <th>Massimo</th>
+                            <th>Statistica</th>
+                            {% for item in data_list %}
+                                <th>{{ item.sensor }}</th>
+                            {% endfor %}
                         </tr>
                     </thead>
                     <tbody>
-                        {% for s in data_list %}
                         <tr>
-                            <td class="highlight">{{ s.sensor }}</td>
-                            <td class="val-media">{{ s.media }}</td>
-                            <td class="val-min">{{ s.min }}</td>
-                            <td class="val-max">{{ s.max }}</td>
+                            <td class="row-label">Media</td>
+                            {% for item in data_list %}
+                                <td class="val-media">{{ item.media }}</td>
+                            {% endfor %}
                         </tr>
-                        {% endfor %}
+                        <tr>
+                            <td class="row-label">Minimo</td>
+                            {% for item in data_list %}
+                                <td class="val-min">{{ item.min }}</td>
+                            {% endfor %}
+                        </tr>
+                        <tr>
+                            <td class="row-label">Massimo</td>
+                            {% for item in data_list %}
+                                <td class="val-max">{{ item.max }}</td>
+                            {% endfor %}
+                        </tr>
                     </tbody>
                 </table>
                 {% else %}
-                <div class="empty-state">Nessuna rilevazione trovata per questa sessione nel range di 7 giorni.</div>
+                <div class="empty-state">Nessun dato trovato per questa sessione.</div>
                 {% endif %}
             </div>
             {% endfor %}
         {% else %}
-            <div class="card" style="text-align: center;">
-                <p style="color: #666;">Seleziona un utente per visualizzare le statistiche delle sessioni.</p>
-            </div>
+            <div class="empty-state">Nessun utente selezionato o nessun dato presente.</div>
         {% endif %}
     </div>
 </body>
