@@ -330,7 +330,6 @@ def statistics_page():
     selected_sess = request.args.get('s', lista_sessioni[0])
 
     # 3. Trova la data più recente nel database per l'utente selezionato
-    #    per calcolare "ultimi 7 giorni" come nel tuo SQLite
     latest_query = db.collection('dati_sensori')\
                      .where('user', '==', selected_user)\
                      .where('session', '==', selected_sess)\
@@ -340,7 +339,16 @@ def statistics_page():
     latest_docs = list(latest_query.stream())
     if latest_docs:
         latest_ts = latest_docs[0].to_dict().get('timestamp')
-        if latest_ts:
+        
+        # CONVERTI timestamp da stringa a datetime se necessario
+        if isinstance(latest_ts, str):
+            try:
+                # Prova a parsare la stringa timestamp
+                latest_ts = parser.parse(latest_ts)
+            except:
+                latest_ts = None
+        
+        if latest_ts and hasattr(latest_ts, 'strftime'):
             # Data di 7 giorni prima della data più recente
             end_date = latest_ts
             start_date = latest_ts - timedelta(days=7)
@@ -362,18 +370,28 @@ def statistics_page():
             query = db.collection('dati_sensori')\
                       .where('user', '==', selected_user)\
                       .where('sensor', '==', s)\
-                      .where('session', '==', selected_sess)\
-                      .where('timestamp', '>=', start_date)\
-                      .where('timestamp', '<=', end_date)
+                      .where('session', '==', selected_sess)
             
             results = [d.to_dict() for d in query.stream()]
             raw_values = []
             
             for r in results:
                 try:
+                    # Filtra per data (manualmente perché Firestore non supporta datetime stringa)
+                    ts = r.get('timestamp')
+                    if isinstance(ts, str):
+                        ts_parsed = parser.parse(ts)
+                    else:
+                        ts_parsed = ts
+                    
+                    # Controlla se il timestamp è nel range degli ultimi 7 giorni
+                    if ts_parsed and hasattr(ts_parsed, 'strftime'):
+                        if not (start_date <= ts_parsed <= end_date):
+                            continue
+                    
                     val_raw = r.get('valori', {})
                     
-                    # Parsing valori (gestisce sia dict che stringa)
+                    # Parsing valori
                     if isinstance(val_raw, str):
                         val = json.loads(val_raw.replace("'", '"'))
                     else:
@@ -385,14 +403,12 @@ def statistics_page():
                         az = float(val.get('az', val.get('z', 0)))
                         raw_values.append(math.sqrt(ax**2 + ay**2 + az**2))
                     else:
-                        # Prende il primo valore disponibile
                         if isinstance(val, dict) and val:
                             first_val = next(iter(val.values()))
                             raw_values.append(float(first_val))
                         else:
                             raw_values.append(float(val))
                 except (ValueError, TypeError, KeyError, StopIteration) as e:
-                    print(f"Errore parsing {s}: {e}")
                     continue
 
             if raw_values:
@@ -412,7 +428,10 @@ def statistics_page():
             stats_results[s] = None
 
     # Formatta le date per la visualizzazione
-    periodo_str = f"{start_date.strftime('%d/%m/%Y')} - {end_date.strftime('%d/%m/%Y')}"
+    if hasattr(start_date, 'strftime'):
+        periodo_str = f"{start_date.strftime('%d/%m/%Y')} - {end_date.strftime('%d/%m/%Y')}"
+    else:
+        periodo_str = "Dati del 2021"
 
     return render_template_string('''
     <html>
@@ -509,7 +528,7 @@ def statistics_page():
                                 <td class="stats-value">{{ vals.max }}</td>
                                 <td class="stats-value">{{ vals.count }}</td>
                                 {% else %}
-                                <td colspan="6" class="no-data">❌ Nessun dato negli ultimi 7 giorni</td>
+                                <td colspan="7" class="no-data">❌ Nessun dato negli ultimi 7 giorni</td>
                                 {% endif %}
                             </tr>
                             {% endfor %}
