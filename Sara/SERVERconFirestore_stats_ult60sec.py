@@ -10,8 +10,6 @@ import os
 import time
 import threading
 
-import deque
-
 app = Flask(__name__)
 app.secret_key = "p4ssw0rd" 
 
@@ -253,18 +251,6 @@ def _buffer_update(user, session_id, sensor, valori):
         st["min"] = min(st["min"], x)
         st["max"] = max(st["max"], x)
 
-# ✅ FINESTRA MOBILE: aggiorna sliding window in RAM
-try:
-    _window_update(
-        user=data.get('user'),
-        session_id=data.get('session'),
-        sensor=data.get('sensor'),
-        valori=valori_data,
-        t_epoch_sec=ts_datetime.timestamp()
-    )
-except Exception as e:
-    print(f"[STATS] Errore window_update: {e}")
-
 
 @firestore.transactional
 def _merge_stats_tx(transaction, doc_ref, delta_stats, win_snapshot=None):
@@ -363,8 +349,6 @@ def _flush_stats_once():
             _merge_stats_tx(tx, doc_ref, delta_stats, win_snapshot=win_snap)
         except Exception as e:
             print(f"[STATS] Errore flush {doc_id}: {e}")
-        except Exception as e:
-            print(f"[STATS] Errore flush {doc_id}: {e}")
 
 
 def _stats_flusher_loop():
@@ -422,6 +406,18 @@ def receive_data():
             )
         except Exception as e:
             print(f"[STATS] Errore buffer_update: {e}")
+
+        # ✅ FINESTRA MOBILE: aggiorna sliding window (ultimi STATS_WINDOW_SECONDS secondi)
+        try:
+            _window_update(
+                user=data.get('user'),
+                session_id=data.get('session'),
+                sensor=data.get('sensor'),
+                valori=valori_data,
+                t_epoch_sec=ts_datetime.timestamp()
+            )
+        except Exception as e:
+            print(f"[STATS] Errore window_update: {e}")
 
         return jsonify({"status": "success"}), 200
     except Exception as e:
