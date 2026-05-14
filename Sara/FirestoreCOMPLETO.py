@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, session, redirect, url_for, render_template_string
-from datetime import datetime,timezone, timedelta
+from datetime import datetime, timezone, timedelta
+from dateutil import parser
 import json
 import math
 import statistics
@@ -19,20 +20,16 @@ def receive_data():
         return jsonify({"status": "error", "message": "No data"}), 400
     try:
         raw_ts = data.get('timestamp')
-        # 1. Creiamo l'oggetto data/ora corretto
         ts_datetime = datetime.fromtimestamp(float(raw_ts) / 1000)
-        
-        # 2. Prendiamo i valori (es: {"temp": 33.81})
         valori_data = data.get('data') 
 
-        # Salvataggio su Firestore
         doc_ref = db.collection('dati_sensori').document()
         doc_ref.set({
             'user': data.get('user'),
             'session': data.get('session'),
             'sensor': data.get('sensor'),
-            'timestamp': ts_datetime,      # Ora è un vero Timestamp
-            'valori': valori_data,         # Salvato come MAP (non stringa!), meglio per i calcoli
+            'timestamp': ts_datetime,
+            'valori': valori_data,
             'data_ricezione': datetime.now(timezone(timedelta(hours=2)))
         })
         return jsonify({"status": "success"}), 200
@@ -51,21 +48,27 @@ def login():
     if request.method == 'POST':
         username = request.form.get('username')
         password = request.form.get('password')
+        tipo_scelto = request.form.get('tipo_utente')
         
-        print(f"Tentativo di login per: {username}") # Debug
+        print(f"Tentativo di login per: {username}")
         
         try:
             user_doc = db.collection('utenti').document(username).get()
             
             if user_doc.exists:
                 user_data = user_doc.to_dict()
-                print(f"Utente trovato in DB. Controllo password...") # Debug
+                print(f"Utente trovato in DB. Controllo password...")
                 
                 if str(user_data.get('password')) == str(password):
                     session['user'] = username
-                    session['tipo'] = request.form.get('tipo_utente')
-                    print("Login successo! Reindirizzamento...") # Debug
-                    return redirect(url_for('dashboard'))
+                    session['tipo'] = tipo_scelto
+                    session['id_utente'] = user_data.get('id_utente') # Salviamo l'id_utente (stringa)
+                    print("Login successo! Reindirizzamento...")
+                    
+                    if tipo_scelto == 'admin':
+                        return redirect(url_for('dashboard'))
+                    else:
+                        return redirect(url_for('dashboard_utente'))
                 else:
                     print("Password errata.")
                     error = True
@@ -99,18 +102,15 @@ def logout():
     session.clear()
     return redirect(url_for('login'))
 
-# --- ROTTA DASHBOARD COMPLETA ---
+# --- ROTTA DASHBOARD ADMIN ---
 @app.route('/dashboard_admin')
 def dashboard():
-    # 1. Controllo Sessione rapido
-    if 'user' not in session:
+    if 'user' not in session or session.get('tipo') != 'admin':
         return redirect(url_for('login'))
 
     print(f"DEBUG: Accesso dashboard per l'utente {session['user']}")
 
     try:
-        # 2. Recupero Utenti (Limitato a 50 per evitare blocchi se il DB è grande)
-        # Cerchiamo di ottenere solo i nomi degli utenti unici
         try:
             docs_u = db.collection('dati_sensori').select(['user']).limit(100).stream()
             lista_utenti = sorted(list(set([d.to_dict().get('user') for d in docs_u if d.to_dict().get('user')])))
@@ -118,62 +118,124 @@ def dashboard():
             print(f"Errore recupero utenti: {e}")
             lista_utenti = []
 
-        # Se il database è vuoto o la query fallisce
         if not lista_utenti:
             lista_utenti = ["Nessun dato"]
 
-        # 3. Parametri URL
         selected_user = request.args.get('u', lista_utenti[0])
         selected_sess = request.args.get('s', '01') 
         
-        sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
-        data_charts = {}
+        data_charts = recupera_dati_grafici(selected_user, selected_sess)
 
-        # 4. Recupero Dati per ogni sensore
-        for s in sensori:
-            try:
-                query = db.collection('dati_sensori')\
-                          .where('user', '==', selected_user)\
-                          .where('sensor', '==', s)\
-                          .where('session', '==', selected_sess)\
-                          .order_by('timestamp', direction=firestore.Query.DESCENDING)\
-                          .limit(40) # Limitiamo i punti per caricare velocemente
-                
-                results = [d.to_dict() for d in query.stream()]
-                results.reverse() # Ordine cronologico per Chart.js
-                
-                labels = []
-                for r in results:
-                    ts = r.get('timestamp')
-                    if ts and hasattr(ts, 'strftime'):
-                        # Se è un oggetto datetime di Firestore
-                        labels.append(ts.strftime('%H:%M:%S'))
-                    else:
-                        # Fallback se è rimasta qualche vecchia stringa nel DB
-                        labels.append(str(ts))
-                values = []
-                
-                for r in results:
-                    val_raw = r.get('valori', '{}')
-                    # Pulizia stringa se Firestore ha salvato JSON come stringa
-                    val = json.loads(val_raw.replace("'", '"')) if isinstance(val_raw, str) else val_raw
-                    
-                    if s == "ACC":
-                        ax = float(val.get('ax', val.get('x', 0)))
-                        ay = float(val.get('ay', val.get('y', 0)))
-                        az = float(val.get('az', val.get('z', 0)))
-                        values.append(round(math.sqrt(ax**2 + ay**2 + az**2), 2))
-                    else:
-                        # Prende il primo valore numerico nel dizionario
-                        values.append(float(next(iter(val.values()))))
-                
-                data_charts[s] = {"labels": labels, "values": values}
-            except Exception as e:
-                print(f"Errore sensore {s}: {e}")
-                data_charts[s] = {"labels": [], "values": []}
+        return render_template_string(HTML_DASHBOARD_ORIGINALE, utenti=lista_utenti, selected_u=selected_user, selected_s=selected_sess, data_charts=data_charts)
 
-        # 5. Ritorno dell'HTML (Template Integrato)
-        return render_template_string('''
+    except Exception as e:
+        print(f"ERRORE FATALE: {e}")
+        return f"<h1>Errore di caricamento</h1><p>{e}</p><a href='/logout'>Torna al login</a>"
+
+# --- ROTTA DASHBOARD UTENTE ---
+@app.route('/dashboard_utente')
+def dashboard_utente():
+    if 'user' not in session or session.get('tipo') != 'utente':
+        return redirect(url_for('login'))
+
+    mio_id = session.get('id_utente') # Prende l'id_utente stringa (es: "02")
+    selected_sess = request.args.get('s', '01') 
+    
+    data_charts = recupera_dati_grafici(mio_id, selected_sess)
+
+    # Passiamo in utenti solo una lista con il proprio ID per far funzionare il render senza errori
+    return render_template_string(HTML_DASHBOARD_ORIGINALE, utenti=[mio_id], selected_u=mio_id, selected_s=selected_sess, data_charts=data_charts)
+
+# --- FUNZIONE REFACTOR PER RECUPERO DATI ---
+def recupera_dati_grafici(target_user, session_id):
+    sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
+    data_charts = {}
+    for s in sensori:
+        try:
+            query = db.collection('dati_sensori')\
+                      .where('user', '==', str(target_user))\
+                      .where('sensor', '==', s)\
+                      .where('session', '==', session_id)\
+                      .order_by('timestamp', direction=firestore.Query.DESCENDING)\
+                      .limit(40)
+            
+            results = [d.to_dict() for d in query.stream()]
+            results.reverse()
+            
+            labels = []
+            for r in results:
+                ts = r.get('timestamp')
+                if ts and hasattr(ts, 'strftime'):
+                    labels.append(ts.strftime('%H:%M:%S'))
+                else:
+                    labels.append(str(ts))
+            
+            values = []
+            for r in results:
+                val_raw = r.get('valori', '{}')
+                val = json.loads(val_raw.replace("'", '"')) if isinstance(val_raw, str) else val_raw
+                
+                if s == "ACC":
+                    ax = float(val.get('ax', val.get('x', 0)))
+                    ay = float(val.get('ay', val.get('y', 0)))
+                    az = float(val.get('az', val.get('z', 0)))
+                    values.append(round(math.sqrt(ax**2 + ay**2 + az**2), 2))
+                else:
+                    values.append(float(next(iter(val.values()), 0)))
+            
+            data_charts[s] = {"labels": labels, "values": values}
+        except Exception as e:
+            print(f"Errore sensore {s}: {e}")
+            data_charts[s] = {"labels": [], "values": []}
+    return data_charts
+
+# --- ROTTA REGISTRAZIONE ---
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if 'user' not in session or session.get('tipo') != 'admin':
+        return "Accesso negato.", 403
+
+    message = ""
+    if request.method == 'POST':
+        username = request.form.get('username')
+        user_ref = db.collection('utenti').document(username)
+        if not user_ref.get().exists:
+            user_ref.set({
+                'username': username,
+                'password': request.form.get('password'),
+                'id_utente': request.form.get('id_utente'),
+                'cellulare': request.form.get('cellulare')
+            })
+            message = f"Utente {username} registrato con successo!"
+        else:
+            message = "Errore: Lo username esiste già."
+
+    return render_template_string('''
+    <html>
+    <body style="font-family:sans-serif; background:#f0f2f5; display:flex; justify-content:center; align-items:center; height:100vh; margin:0;">
+        <div style="background:white; padding:2rem; border-radius:12px; box-shadow:0 10px 25px rgba(0,0,0,0.1); width:350px;">
+            <h2 style="color:#1a73e8; margin-top:0; text-align:center;">Registrazione Utente</h2>
+            {% if msg %}<div style="padding:10px; margin-bottom:15px; border-radius:6px; background:#e8f0fe; color:#1a73e8; font-size:0.9rem; text-align:center;">{{ msg }}</div>{% endif %}
+            <form method="post">
+                <label style="font-size:0.85rem; color:#555;">Username:</label>
+                <input type="text" name="username" required style="width:100%; margin-bottom:15px; padding:10px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;">
+                <label style="font-size:0.85rem; color:#555;">Password:</label>
+                <input type="password" name="password" required style="width:100%; margin-bottom:15px; padding:10px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;">
+                <label style="font-size:0.85rem; color:#555;">ID Utente :</label>
+                <input type="text" name="id_utente" placeholder="Es: 02" required style="width:100%; margin-bottom:15px; padding:10px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;">
+                <label style="font-size:0.85rem; color:#555;">Cellulare:</label>
+                <input type="text" name="cellulare" style="width:100%; margin-bottom:20px; padding:10px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;">
+                <input type="submit" value="Registra Utente" style="width:100%; padding:12px; background:#1a73e8; color:white; border:none; border-radius:6px; cursor:pointer; font-weight:bold;">
+            </form>
+            <div style="text-align:center; margin-top:15px;"><a href="/dashboard_admin" style="color:#666; font-size:0.85rem; text-decoration:none;">← Dashboard</a></div>
+        </div>
+    </body>
+    </html>
+    ''', msg=message)
+
+
+# --- TEMPLATE HTML ORIGINALE PRESERVATO PARI PARI ---
+HTML_DASHBOARD_ORIGINALE = '''
 <!DOCTYPE html>
 <html lang="it">
 <head>
@@ -196,15 +258,20 @@ def dashboard():
     <div class="navbar">
         <h2 style="margin:0; font-size: 1.4rem;">Empatica E4 Dashboard</h2>
         <div class="nav-links">
-            <a href="/dashboard_admin">Dashboard</a>
-            <a href="/statistics_admin">Statistiche</a>
-            <a href="/register">Nuovo Utente</a>
+            {% if session['tipo'] == 'admin' %}
+                <a href="/dashboard_admin">Dashboard</a>
+                <a href="/statistics_admin">Statistiche</a>
+                <a href="/register">Nuovo Utente</a>
+            {% else %}
+                <a href="/dashboard_utente">Dashboard</a>
+            {% endif %}
             <a href="/logout" style="color: #ffcccc;">Logout</a>
         </div>
     </div>
 
     <div class="container">
         <div class="card-controls">
+            {% if session['tipo'] == 'admin' %}
             <div>
                 <label><b>Utente:</b></label>
                 <select id="userSelect" onchange="update()">
@@ -213,6 +280,12 @@ def dashboard():
                     {% endfor %}
                 </select>
             </div>
+            {% else %}
+            <div>
+                <label><b>ID Utente:</b> {{ session['id_utente'] }}</label>
+            </div>
+            {% endif %}
+            
             <div>
                 <label><b>Sensore:</b></label>
                 <select id="sensorSelect" onchange="changeSensor()">
@@ -278,9 +351,15 @@ def dashboard():
         }
 
         function update() {
-            const u = document.getElementById('userSelect').value;
             const s = document.getElementById('sessSelect').value;
-            window.location.href = `/dashboard_admin?u=${u}&s=${s}`;
+            
+            // Gestione URL dinamica basata sul ruolo per non rompere il refresh/update
+            if ("{{ session['tipo'] }}" === "admin") {
+                const u = document.getElementById('userSelect').value;
+                window.location.href = `/dashboard_admin?u=${u}&s=${s}`;
+            } else {
+                window.location.href = `/dashboard_utente?s=${s}`;
+            }
         }
 
         function changeSensor() {
@@ -289,67 +368,17 @@ def dashboard():
             render(s);
         }
 
-        // Inizializzazione
         window.onload = () => {
             const last = localStorage.getItem('lastSensor') || 'HR';
             document.getElementById('sensorSelect').value = last;
             render(last);
         };
 
-        // Refresh automatico ogni 20 secondi
         setTimeout(() => location.reload(), 20000);
     </script>
 </body>
 </html>
-        ''', utenti=lista_utenti, selected_u=selected_user, selected_s=selected_sess, data_charts=data_charts)
-
-    except Exception as e:
-        print(f"ERRORE FATALE: {e}")
-        return f"<h1>Errore di caricamento</h1><p>{e}</p><a href='/logout'>Torna al login</a>"
-
-
-@app.route('/register', methods=['GET', 'POST'])
-def register():
-    if 'user' not in session or session.get('user') != 'admin':
-        return "Accesso negato.", 403
-
-    message = ""
-    if request.method == 'POST':
-        username = request.form.get('username')
-        user_ref = db.collection('utenti').document(username)
-        if not user_ref.get().exists:
-            user_ref.set({
-                'username': username,
-                'password': request.form.get('password'),
-                'id_utente': request.form.get('id_utente'),
-                'cellulare': request.form.get('cellulare')
-            })
-            message = f"Utente {username} registrato con successo!"
-        else:
-            message = "Errore: Lo username esiste già."
-
-    return render_template_string('''
-    <html>
-    <body style="font-family:sans-serif; background:#f0f2f5; display:flex; justify-content:center; align-items:center; height:100vh; margin:0;">
-        <div style="background:white; padding:2rem; border-radius:12px; box-shadow:0 10px 25px rgba(0,0,0,0.1); width:350px;">
-            <h2 style="color:#1a73e8; margin-top:0; text-align:center;">Registrazione Utente</h2>
-            {% if msg %}<div style="padding:10px; margin-bottom:15px; border-radius:6px; background:#e8f0fe; color:#1a73e8; font-size:0.9rem; text-align:center;">{{ msg }}</div>{% endif %}
-            <form method="post">
-                <label style="font-size:0.85rem; color:#555;">Username:</label>
-                <input type="text" name="username" required style="width:100%; margin-bottom:15px; padding:10px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;">
-                <label style="font-size:0.85rem; color:#555;">Password:</label>
-                <input type="password" name="password" required style="width:100%; margin-bottom:15px; padding:10px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;">
-                <label style="font-size:0.85rem; color:#555;">ID Utente :</label>
-                <input type="text" name="id_utente" placeholder="Es: 02" required style="width:100%; margin-bottom:15px; padding:10px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;">
-                <label style="font-size:0.85rem; color:#555;">Cellulare:</label>
-                <input type="text" name="cellulare" style="width:100%; margin-bottom:20px; padding:10px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;">
-                <input type="submit" value="Registra Utente" style="width:100%; padding:12px; background:#1a73e8; color:white; border:none; border-radius:6px; cursor:pointer; font-weight:bold;">
-            </form>
-            <div style="text-align:center; margin-top:15px;"><a href="/dashboard_admin" style="color:#666; font-size:0.85rem; text-decoration:none;">← Dashboard</a></div>
-        </div>
-    </body>
-    </html>
-    ''', msg=message)
+'''
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    app.run(host='0.0.0.0', port=5000, debug=True)
