@@ -102,15 +102,27 @@ def logout():
     session.clear()
     return redirect(url_for('login'))
 
-# --- ROTTA API PER L'ULTIMO DATO IN TEMPO REALE ---
+# --- ROTTA API PER L'ULTIMO DATO IN TEMPO REALE (SOLO UTENTI REGISTRATI) ---
 @app.route('/api/live_data')
 def api_live_data():
     if 'user' not in session or session.get('tipo') != 'admin':
         return jsonify({"status": "error", "message": "Accesso negato"}), 403
         
     try:
-        # Prende l'ultimo documento inserito in assoluto basandosi sulla data di ricezione
+        # 1. Recuperiamo tutti gli id_utente validi dalla collezione 'utenti'
+        docs_utenti = db.collection('utenti').stream()
+        id_validi = [d.to_dict().get('id_utente') for d in docs_utenti if d.to_dict().get('id_utente')]
+        
+        # Se non ci sono utenti registrati nel sistema, ci fermiamo subito
+        if not id_validi:
+            return jsonify({"message": "Nessun utente registrato nel database"}), 404
+
+        # Nota: L'operatore 'in' di Firestore supporta liste fino a 30 elementi.
+        # Se hai più di 30 utenti, usa le prime 30 posizioni: id_validi[:30]
+        
+        # 2. Interroghiamo i dati sensori filtrando SOLO per gli ID utenti registrati
         query = db.collection('dati_sensori')\
+                  .where('user', 'in', id_validi)\
                   .order_by('data_ricezione', direction=firestore.Query.DESCENDING)\
                   .limit(1)
         
@@ -119,8 +131,6 @@ def api_live_data():
         if results:
             ultimo_dato = results[0]
             
-            # Formattiamo il timestamp per mostrarlo come millisecondi (come nella foto)
-            # Se è un oggetto datetime di Firestore, estraiamo i millisecondi totali
             ts = ultimo_dato.get('timestamp')
             ts_millisecondi = int(ts.timestamp() * 1000) if hasattr(ts, 'timestamp') else str(ts)
             
@@ -132,10 +142,10 @@ def api_live_data():
                 "valori": ultimo_dato.get('valori', {})
             })
         else:
-            return jsonify({"message": "Nessun dato presente nel DB"}), 404
+            return jsonify({"message": "Nessun dato trovato per gli utenti registrati"}), 404
             
     except Exception as e:
-        print(f"Errore API live data: {e}")
+        print(f"Errore API live data filtrata: {e}")
         return jsonify({"status": "error"}), 500
 
 
