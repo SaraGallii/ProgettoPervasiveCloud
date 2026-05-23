@@ -41,7 +41,7 @@ _flusher_thread = None
 # FINESTRA MOBILE (sliding window) in RAM
 # ============================================================
 # Durata finestra in secondi (default 60). Modificabile via env var.
-STATS_WINDOW_SECONDS = int(os.environ.get("STATS_WINDOW_SECONDS", "60"))
+STATS_WINDOW_SECONDS = int(os.environ.get("STATS_WINDOW_SECONDS", "20"))
 
 # Stato finestra: key=(user,session,sensor) -> dict
 # dq contiene tuple (t_epoch_sec, value)
