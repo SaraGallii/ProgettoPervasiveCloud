@@ -1,0 +1,2210 @@
+from flask import Flask, request, jsonify, session, redirect, url_for, render_template_string
+from datetime import datetime, timezone, timedelta
+from dateutil import parser
+import json
+import math
+import statistics
+from google.cloud import firestore
+
+import os
+import time
+import threading
+
+from collections import deque
+
+import atexit
+import signal
+import sys
+
+import requests
+
+app = Flask(__name__)
+app.secret_key = "p4ssw0rd" 
+
+# Inizializzazione Firestore
+db = firestore.Client.from_service_account_json('progetto-pcloud-5-b8e46802d217.json')
+
+# ============================================================
+# STATISTICHE "PRO": buffer in RAM + flush periodico su Firestore
+# ============================================================
+
+# Intervallo flush (secondi). Consigliato 2–5. Default 3.
+STATS_FLUSH_INTERVAL = 3.0
+
+_stats_lock = threading.Lock()
+_stats_buffer = {}   # key=(user,session,sensor) -> {"user","session","sensor","n","mean","m2","min","max"}
+_flusher_started = False
+
+# --- Shutdown/stop flusher + pulizia RAM ---
+_stop_event = threading.Event()
+_flusher_thread = None
+
+# ============================================================
+# FINESTRA MOBILE (sliding window) in RAM
+# ============================================================
+# Durata finestra in secondi (default 60). Modificabile via env var.
+STATS_WINDOW_SECONDS = 20
+
+# Stato finestra: key=(user,session,sensor) -> dict
+# dq contiene tuple (t_epoch_sec, value)
+_window_state = {}  # key -> {"dq":deque, "sum":float, "sumsq":float, "min":float, "max":float, "dirty":bool}
+
+INTENSITY_LABELS_IT = {
+    "low": "basso",
+    "medium": "medio",
+    "high": "alto",
+}
+
+
+
+def get_user_session_mapping_by_id(id_utente: str):
+    """
+    Ritorna mapping intensity->session_id per un id_utente (es: "03").
+    Legge dalla collezione 'utenti' cercando doc con campo id_utente.
+    """
+    try:
+        q = db.collection("utenti").where("id_utente", "==", str(id_utente).strip()).limit(1).stream()
+        doc = next(q, None)
+        if not doc:
+            return None
+        u = doc.to_dict() or {}
+        low_s = str(u.get("low_session", "")).strip()
+        med_s = str(u.get("medium_session", "")).strip()
+        high_s = str(u.get("high_session", "")).strip()
+        if not (low_s and med_s and high_s):
+            return None
+        return {"low": low_s, "medium": med_s, "high": high_s}
+    except Exception as e:
+        print(f"[MAP] Errore get_user_session_mapping_by_id({id_utente}): {e}")
+        return None
+
+
+def invert_session_mapping(map_intensity_to_session: dict):
+    if not map_intensity_to_session:
+        return {}
+    inv = {}
+    for k, v in map_intensity_to_session.items():
+        inv[str(v).strip()] = k
+    return inv
+
+
+def build_session_options_for_user(id_utente: str):
+    """
+    Opzioni dropdown: [(label_it, session_id)] in ordine basso/medio/alto.
+    Fallback 01/02/03 se mapping mancante (utenti vecchi).
+    """
+    m = get_user_session_mapping_by_id(id_utente) or {"low": "01", "medium": "02", "high": "03"}
+    return [
+        (INTENSITY_LABELS_IT["low"], m["low"]),
+        (INTENSITY_LABELS_IT["medium"], m["medium"]),
+        (INTENSITY_LABELS_IT["high"], m["high"]),
+    ]
+
+
+def intensity_from_session(id_utente: str, session_id: str):
+    """
+    Data sessione numerica (01/02/03) ritorna 'low'/'medium'/'high'
+    usando la mappatura dell'utente.
+    """
+    m = get_user_session_mapping_by_id(id_utente) or {"low": "01", "medium": "02", "high": "03"}
+    inv = invert_session_mapping(m)
+    return inv.get(str(session_id).strip(), "low")
+
+
+def session_label_from_session_id(id_utente: str, session_id: str) -> str:
+    """
+    Converte session_id ("01"/"02"/"03") nell'etichetta italiana
+    "basso"/"medio"/"alto" usando la mappatura salvata per l'utente.
+    """
+    intensity_key = intensity_from_session(id_utente, session_id)
+    return INTENSITY_LABELS_IT.get(intensity_key, str(session_id).strip())
+
+
+def _mark_session_started(user: str, session_id: str, now_epoch: float = None):
+    """
+    Registra l'inizio della sessione al primo dato ricevuto.
+    Warmup condiviso per tutti i sensori della stessa sessione.
+    """
+    if now_epoch is None:
+        now_epoch = time.time()
+
+    key = (str(user).strip(), str(session_id).strip())
+    with _stats_lock:
+        if key not in _session_first_seen:
+            _session_first_seen[key] = float(now_epoch)
+
+
+def _warmup_completed(user: str, session_id: str, now_epoch: float = None) -> bool:
+    """
+    True se sono passati almeno WARMUP_SECONDS dall'inizio della sessione.
+    """
+    if now_epoch is None:
+        now_epoch = time.time()
+
+    key = (str(user).strip(), str(session_id).strip())
+    with _stats_lock:
+        first_seen = _session_first_seen.get(key)
+
+    if first_seen is None:
+        return False
+
+    return (float(now_epoch) - float(first_seen)) >= WARMUP_SECONDS
+
+
+def _warmup_remaining_seconds(user: str, session_id: str, now_epoch: float = None) -> int:
+    """
+    Secondi rimanenti prima che il warmup finisca.
+    """
+    if now_epoch is None:
+        now_epoch = time.time()
+
+    key = (str(user).strip(), str(session_id).strip())
+    with _stats_lock:
+        first_seen = _session_first_seen.get(key)
+
+    if first_seen is None:
+        return WARMUP_SECONDS
+
+    remaining = WARMUP_SECONDS - (float(now_epoch) - float(first_seen))
+    return max(0, int(math.ceil(remaining)))
+
+
+def build_mean_shift_context(user: str, session_id: str, sensor: str, global_stats: dict, win: dict):
+    """
+    Costruisce un contesto strutturato per mostrare in modo elegante
+    l'anomalia media finestra vs media globale.
+    """
+    if not sensor or not global_stats or not win:
+        return None
+
+    try:
+        gmean = float(global_stats.get("mean"))
+        wmean = float(win.get("mean"))
+    except Exception:
+        return None
+
+    if gmean == 0.0:
+        return None
+
+    sensor_norm = str(sensor).upper().strip()
+    thr_pct = MEAN_SHIFT_PCT.get(sensor_norm)
+    if thr_pct is None:
+        return None
+
+    delta_pct = abs((wmean - gmean) / gmean) * 100.0
+    direction = "sopra" if wmean > gmean else "sotto"
+    delta_sign = "+" if wmean > gmean else "-"
+
+    session_label = session_label_from_session_id(user, session_id)
+
+    return {
+        "user": str(user).strip(),
+        "session_id": str(session_id).strip(),
+        "session_label": session_label,
+        "sensor": sensor_norm,
+        "threshold_pct": float(thr_pct),
+        "delta_pct": float(delta_pct),
+        "direction": direction,
+        "delta_sign": delta_sign,
+        "window_mean": float(wmean),
+        "global_mean": float(gmean),
+        "window_count": int(win.get("count", 0)),
+        "global_count": int(global_stats.get("count", 0)),
+        "window_seconds": int(win.get("seconds", STATS_WINDOW_SECONDS))
+    }
+
+
+def format_telegram_anomaly_message(ctx: dict) -> str:
+    """
+    Messaggio Telegram elegante e compatto.
+    """
+    return (
+        f"⚠️ Anomalia rilevata\n"
+        f"👤 Utente: {ctx['user']}\n"
+        f"🎚️ Intensità: {ctx['session_label']}\n"
+        f"📡 Sensore: {ctx['sensor']}\n"
+        f"📈 Scostamento: {ctx['delta_sign']}{ctx['delta_pct']:.2f}% "
+        f"(soglia ±{ctx['threshold_pct']:.2f}%)\n"
+        f"🪟 Media finestra ({ctx['window_seconds']}s): {ctx['window_mean']:.3f}\n"
+        f"🌍 Media globale: {ctx['global_mean']:.3f}\n"
+        f"🔢 Campioni finestra/globale: {ctx['window_count']}/{ctx['global_count']}"
+    )
+
+
+def format_web_anomaly_message(ctx: dict) -> str:
+    """
+    Messaggio leggibile per la pagina statistiche.
+    """
+    return (
+        f"La media degli ultimi {ctx['window_seconds']}s è {ctx['direction']} "
+        f"la media globale del {ctx['delta_pct']:.2f}% "
+        f"(soglia ±{ctx['threshold_pct']:.2f}%). "
+        f"Media finestra: {ctx['window_mean']:.3f} • "
+        f"Media globale: {ctx['global_mean']:.3f}."
+    )
+
+
+# ============================================================
+# ANOMALIA MEDIA (finestra mobile vs media globale della sessione)
+# ============================================================
+
+# Soglie percentuali "sensibili" (scostamento relativo win.mean vs mean globale)
+MEAN_SHIFT_PCT = {
+    "HR":   3.0,    # 3%
+    "IBI":  4.0,    # 4%
+    "TEMP": 0.3,    # 0.3%
+    "EDA":  10.0,   # 10% (se vuoi 12% -> metti 12.0)
+    "BVP":  10.0,   # 10% (su mean|BVP|)
+    "ACC":  15.0,   # 15% (su indice attività)
+}
+
+def evaluate_mean_shift_alert(sensor: str, global_stats: dict, win: dict):
+    """
+    ALERT se la media finestra (win.mean) si discosta dalla media globale cumulata (global_stats.mean)
+    oltre una soglia percentuale per sensore.
+    Ritorna: (thr_pct, alerts_list)
+    """
+    if not sensor:
+        return None, []
+
+    s = str(sensor).upper().strip()
+    thr_pct = MEAN_SHIFT_PCT.get(s)
+    if thr_pct is None:
+        return None, []
+
+    if not global_stats or not win:
+        return thr_pct, []
+
+    gmean = global_stats.get("mean", None)
+    wmean = win.get("mean", None)
+
+    try:
+        gmean = float(gmean)
+        wmean = float(wmean)
+    except Exception:
+        return thr_pct, []
+
+    # Se media globale è 0, la percentuale non è definita.
+    # Hai chiesto niente "minimo assoluto", quindi non segnaliamo in quel caso.
+    if gmean == 0.0:
+        return thr_pct, []
+
+    pct = abs((wmean - gmean) / gmean) * 100.0
+
+    if pct > thr_pct:
+        direction = "sopra" if wmean > gmean else "sotto"
+        msg = (
+            f"Media finestra {direction} media globale: "
+            f"{pct:.2f}% (win={wmean:.3f}, glob={gmean:.3f}, soglia={thr_pct:.2f}%)"
+        )
+        return thr_pct, [msg]
+
+    return thr_pct, []
+
+
+# ============================================================
+# TELEGRAM BOT: polling + subscriptions su Firestore + notifiche
+# ============================================================
+
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+
+# Hard-coded nel codice (come richiesto)
+TELEGRAM_COOLDOWN_SECONDS = 20   # ✅ cooldown stesso alert Telegram
+TELEGRAM_POLL_INTERVAL = 2.0
+
+TELEGRAM_API_BASE = "https://api.telegram.org/bot"
+
+_telegram_started = False
+_telegram_thread = None
+_telegram_stop_event = threading.Event()
+_telegram_last_update_id = 0
+
+# Cooldown in RAM: key=(chat_id, user, session, sensor) -> last_sent_epoch
+_telegram_cooldown = {}
+_telegram_cooldown_lock = threading.Lock()
+
+TELEGRAM_SUBS_COLLECTION = "telegram_subscriptions"
+
+# ============================================================
+# LOGIN GUIDATO TELEGRAM (stato temporaneo per chat)
+# ============================================================
+# _pending_telegram_logins[chat_id] = {
+#   "role": "admin" | "utente",
+#   "step": "await_username" | "await_password",
+#   "username": "..."
+# }
+_pending_telegram_logins = {}
+_pending_telegram_logins_lock = threading.Lock()
+
+# ============================================================
+# WARMUP SESSIONE (prima di inviare alert Telegram)
+# ============================================================
+WARMUP_SECONDS = 60
+
+# key=(user, session) -> first_seen_epoch
+_session_first_seen = {}
+
+
+def _tg_api_url(method: str) -> str:
+    return f"{TELEGRAM_API_BASE}{TELEGRAM_BOT_TOKEN}/{method}"
+
+
+def telegram_send_message(chat_id: int, text: str):
+    """Invia un messaggio Telegram (best effort)."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        requests.post(
+            _tg_api_url("sendMessage"),
+            json={"chat_id": chat_id, "text": text},
+            timeout=5
+        )
+    except Exception as e:
+        print(f"[TG] Errore invio messaggio a {chat_id}: {e}")
+
+
+def telegram_save_subscription(chat_id: int, role: str, username: str, id_utente: str = None):
+    """Salva/aggiorna la subscription su Firestore: doc_id = chat_id."""
+    doc_ref = db.collection(TELEGRAM_SUBS_COLLECTION).document(str(chat_id))
+    payload = {
+        "chat_id": int(chat_id),
+        "role": role,  # "utente" o "admin"
+        "username": str(username),
+        "updated_at": datetime.now(timezone.utc)
+    }
+    if id_utente is not None:
+        payload["id_utente"] = str(id_utente).strip()
+    doc_ref.set(payload, merge=True)
+
+
+def telegram_delete_subscription(chat_id: int):
+    """Rimuove subscription (logout)."""
+    try:
+        db.collection(TELEGRAM_SUBS_COLLECTION).document(str(chat_id)).delete()
+    except Exception as e:
+        print(f"[TG] Errore delete subscription {chat_id}: {e}")
+
+
+def telegram_get_admin_chat_ids():
+    """Ritorna lista chat_id degli admin."""
+    try:
+        q = db.collection(TELEGRAM_SUBS_COLLECTION).where("role", "==", "admin").stream()
+        return [int(d.to_dict().get("chat_id")) for d in q if d.to_dict().get("chat_id") is not None]
+    except Exception as e:
+        print(f"[TG] Errore get_admin_chat_ids: {e}")
+        return []
+
+
+def telegram_get_user_chat_ids(id_utente: str):
+    """Ritorna lista chat_id degli utenti loggati con quell'id_utente."""
+    try:
+        q = db.collection(TELEGRAM_SUBS_COLLECTION)\
+              .where("role", "==", "utente")\
+              .where("id_utente", "==", str(id_utente).strip())\
+              .stream()
+        return [int(d.to_dict().get("chat_id")) for d in q if d.to_dict().get("chat_id") is not None]
+    except Exception as e:
+        print(f"[TG] Errore get_user_chat_ids({id_utente}): {e}")
+        return []
+
+
+def _verify_credentials(username: str, password: str):
+    """
+    Verifica credenziali su Firestore.
+    Ritorna (ok, user_data_dict)
+    """
+    try:
+        doc = db.collection("utenti").document(str(username)).get()
+        if not doc.exists:
+            return False, None
+        u = doc.to_dict() or {}
+        if str(u.get("password")) != str(password):
+            return False, None
+        return True, u
+    except Exception as e:
+        print(f"[TG] Errore verify_credentials: {e}")
+        return False, None
+
+
+def _set_pending_telegram_login(chat_id: int, role: str, step: str, username: str = None):
+    """
+    Salva/aggiorna lo stato del login guidato Telegram per una chat.
+    """
+    payload = {
+        "role": str(role).strip(),
+        "step": str(step).strip()
+    }
+    if username is not None:
+        payload["username"] = str(username)
+
+    with _pending_telegram_logins_lock:
+        _pending_telegram_logins[int(chat_id)] = payload
+
+
+def _get_pending_telegram_login(chat_id: int):
+    """
+    Ritorna lo stato del login guidato per la chat, oppure None.
+    """
+    with _pending_telegram_logins_lock:
+        return _pending_telegram_logins.get(int(chat_id))
+
+
+def _clear_pending_telegram_login(chat_id: int):
+    """
+    Elimina lo stato del login guidato per la chat.
+    """
+    with _pending_telegram_logins_lock:
+        _pending_telegram_logins.pop(int(chat_id), None)
+
+
+def _handle_telegram_command(chat_id: int, text: str):
+    """
+    Gestisce i comandi Telegram con login guidato a step.
+
+    Flusso supportato:
+      /start
+      /login_utente
+      /login_admin
+      /logout
+      /annulla
+
+    Login guidato:
+      1) /login_utente oppure /login_admin
+      2) bot chiede username
+      3) bot chiede password
+      4) verifica credenziali e salva subscription
+    """
+    t = (text or "").strip()
+
+    # =========================
+    # Comandi globali
+    # =========================
+    if t.startswith("/start"):
+        _clear_pending_telegram_login(chat_id)
+        telegram_send_message(
+            chat_id,
+            "Ciao! Sono Anomalie Pcloud.\n"
+            "Comandi disponibili:\n"
+            "/login_utente\n"
+            "/login_admin\n"
+            "/logout\n"
+            "/annulla\n\n"
+            "Per il login guidato ti chiederò prima username e poi password."
+        )
+        return
+
+    if t.startswith("/logout"):
+        _clear_pending_telegram_login(chat_id)
+        telegram_delete_subscription(chat_id)
+        telegram_send_message(chat_id, "Logout eseguito. Non riceverai più notifiche.")
+        return
+
+    if t.startswith("/annulla"):
+        _clear_pending_telegram_login(chat_id)
+        telegram_send_message(chat_id, "Operazione annullata.")
+        return
+
+    # =========================
+    # Avvio login guidato
+    # =========================
+    if t.startswith("/login_utente"):
+        _set_pending_telegram_login(chat_id, role="utente", step="await_username")
+        telegram_send_message(
+            chat_id,
+            "👤 Login utente avviato.\n"
+            "Inserisci username utente:"
+        )
+        return
+
+    if t.startswith("/login_admin"):
+        _set_pending_telegram_login(chat_id, role="admin", step="await_username")
+        telegram_send_message(
+            chat_id,
+            "🛠️ Login admin avviato.\n"
+            "Inserisci username admin:"
+        )
+        return
+
+    # =========================
+    # Se c'è un login guidato pendente, usa il testo come input
+    # =========================
+    pending = _get_pending_telegram_login(chat_id)
+    if pending:
+        role = str(pending.get("role", "")).strip()
+        step = str(pending.get("step", "")).strip()
+
+        # Step 1: attesa username
+        if step == "await_username":
+            username = t
+            if not username:
+                telegram_send_message(chat_id, "Username non valido. Riprova oppure usa /annulla.")
+                return
+
+            _set_pending_telegram_login(
+                chat_id,
+                role=role,
+                step="await_password",
+                username=username
+            )
+
+            telegram_send_message(
+                chat_id,
+                f"Username ricevuto: {username}\n"
+                f"🔒 Inserisci password:"
+            )
+            return
+
+        # Step 2: attesa password
+        if step == "await_password":
+            username = str(pending.get("username", "")).strip()
+            password = t
+
+            if not username:
+                _clear_pending_telegram_login(chat_id)
+                telegram_send_message(chat_id, "Errore interno login. Riprova con /login_utente o /login_admin.")
+                return
+
+            ok, u = _verify_credentials(username, password)
+
+            # In ogni caso chiudiamo lo stato pending
+            _clear_pending_telegram_login(chat_id)
+
+            if not ok:
+                telegram_send_message(chat_id, "❌ Credenziali non valide. Login annullato.")
+                return
+
+            if role == "utente":
+                id_utente = u.get("id_utente")
+                if not id_utente:
+                    telegram_send_message(chat_id, "❌ Errore: id_utente mancante nel tuo profilo.")
+                    return
+
+                telegram_save_subscription(
+                    chat_id,
+                    role="utente",
+                    username=username,
+                    id_utente=str(id_utente)
+                )
+                telegram_send_message(
+                    chat_id,
+                    f"✅ Login utente OK.\n"
+                    f"Riceverai notifiche per id_utente={id_utente}."
+                )
+                return
+
+            if role == "admin":
+                telegram_save_subscription(
+                    chat_id,
+                    role="admin",
+                    username=username,
+                    id_utente=None
+                )
+                telegram_send_message(
+                    chat_id,
+                    "✅ Login admin OK.\n"
+                    "Riceverai notifiche per tutte le anomalie."
+                )
+                return
+
+            telegram_send_message(chat_id, "❌ Ruolo login non riconosciuto.")
+            return
+
+    # =========================
+    # Nessun comando riconosciuto
+    # =========================
+    telegram_send_message(
+        chat_id,
+        "Comando non riconosciuto.\n"
+        "Usa /start per aiuto."
+    )
+
+
+def _telegram_poll_loop():
+    """Polling loop getUpdates."""
+    global _telegram_last_update_id
+
+    if not TELEGRAM_BOT_TOKEN:
+        print("[TG] TELEGRAM_BOT_TOKEN non impostato: polling disattivato.")
+        return
+
+    print("[TG] Polling Telegram avviato.")
+    offset = _telegram_last_update_id + 1 if _telegram_last_update_id else None
+
+    while not _telegram_stop_event.wait(TELEGRAM_POLL_INTERVAL):
+        try:
+            params = {"timeout": 10}
+            if offset is not None:
+                params["offset"] = offset
+
+            r = requests.get(_tg_api_url("getUpdates"), params=params, timeout=15)
+            data = r.json()
+
+            if not data.get("ok"):
+                continue
+
+            updates = data.get("result", [])
+            for upd in updates:
+                upd_id = upd.get("update_id")
+                if upd_id is None:
+                    continue
+                offset = upd_id + 1
+                _telegram_last_update_id = upd_id
+
+                msg = upd.get("message") or upd.get("edited_message")
+                if not msg:
+                    continue
+                chat = msg.get("chat") or {}
+                chat_id = chat.get("id")
+                text = msg.get("text", "")
+                if chat_id is None:
+                    continue
+
+                _handle_telegram_command(int(chat_id), str(text))
+
+        except Exception as e:
+            print(f"[TG] Errore polling: {e}")
+
+
+def start_telegram_polling():
+    """Avvia il thread polling UNA sola volta."""
+    global _telegram_started, _telegram_thread
+    if _telegram_started:
+        return
+
+    # Evita double-start col reloader Flask
+    if app.debug and os.environ.get("WERKZEUG_RUN_MAIN") != "true":
+        return
+
+    _telegram_started = True
+    _telegram_thread = threading.Thread(target=_telegram_poll_loop, daemon=True)
+    _telegram_thread.start()
+
+
+def stop_telegram_polling():
+    try:
+        _telegram_stop_event.set()
+    except Exception:
+        pass
+
+
+def _cooldown_allow(chat_id: int, user: str, session_id: str, sensor: str) -> bool:
+    """
+    True se posso inviare ora, rispettando il cooldown per:
+    stessa chat + stesso utente + stessa sessione + stesso sensore.
+    """
+    key = (int(chat_id), str(user).strip(), str(session_id).strip(), str(sensor).strip())
+    now = time.time()
+    with _telegram_cooldown_lock:
+        last = _telegram_cooldown.get(key, 0.0)
+        if now - last < TELEGRAM_COOLDOWN_SECONDS:
+            return False
+        _telegram_cooldown[key] = now
+        return True
+
+
+
+
+def _to_float(x, default=None):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+def estrai_valore_numerico(sensor, valori):
+    """
+    Converte 'valori' in un valore numerico unico su cui calcolare statistiche.
+    - ACC: magnitudo sqrt(ax^2 + ay^2 + az^2) usando ax/ay/az oppure x/y/z
+    - altri sensori: media di tutti i campi numerici presenti (robusto)
+    """
+    if valori is None:
+        return None
+
+    # Se arriva come stringa, prova a convertirla in dict
+    if isinstance(valori, str):
+        try:
+            valori = json.loads(valori)
+        except Exception:
+            try:
+                valori = json.loads(valori.replace("'", '"'))
+            except Exception:
+                return None
+
+    if not isinstance(valori, dict) or not valori:
+        return None
+
+    s = str(sensor).upper().strip()
+
+    if s == "ACC":
+        ax = _to_float(valori.get('ax', valori.get('x', 0)), 0.0)
+        ay = _to_float(valori.get('ay', valori.get('y', 0)), 0.0)
+        az = _to_float(valori.get('az', valori.get('z', 0)), 0.0)
+        mag = math.sqrt(ax * ax + ay * ay + az * az)
+        # ✅ indice attività: distanza dal 1g (valore medio ~0 se fermo, cresce se c'è movimento)
+        return abs(mag - 1.0)
+
+    if s == "BVP":
+        # mean|BVP|: valore assoluto del segnale (utile per una "media" significativa)
+        # prendo il primo valore numerico disponibile (tipico: {"bvp": ...})
+        vals = []
+        for v in valori.values():
+            fv = _to_float(v, None)
+            if fv is not None:
+                vals.append(fv)
+        if not vals:
+            return None
+        return abs(vals[0]) if len(vals) == 1 else abs(sum(vals) / len(vals))
+
+    nums = []
+    for v in valori.values():
+        fv = _to_float(v, None)
+        if fv is not None:
+            nums.append(fv)
+
+    if not nums:
+        return None
+
+    return nums[0] if len(nums) == 1 else (sum(nums) / len(nums))
+
+def _window_update(user, session_id, sensor, valori, t_epoch_sec):
+    """
+    Aggiorna la finestra mobile per la chiave (user,session,sensor).
+    Mantiene dq con (timestamp_sec, valore) e aggregati sum/sumsq/min/max.
+    """
+    x = estrai_valore_numerico(sensor, valori)
+    if x is None:
+        return
+
+    key = (str(user).strip(), str(session_id).strip(), str(sensor).strip())
+    x = float(x)
+    t = float(t_epoch_sec)
+    cutoff = t - STATS_WINDOW_SECONDS
+
+    with _stats_lock:
+        st = _window_state.get(key)
+        if st is None:
+            st = {
+                "dq": deque(),
+                "sum": 0.0,
+                "sumsq": 0.0,
+                "min": x,
+                "max": x,
+                "dirty": False
+            }
+            _window_state[key] = st
+
+        dq = st["dq"]
+        dq.append((t, x))
+        st["sum"] += x
+        st["sumsq"] += x * x
+
+        # update min/max veloci
+        if len(dq) == 1:
+            st["min"] = x
+            st["max"] = x
+        else:
+            st["min"] = min(st["min"], x)
+            st["max"] = max(st["max"], x)
+
+        # Evict vecchi
+        while dq and dq[0][0] < cutoff:
+            _, old = dq.popleft()
+            st["sum"] -= old
+            st["sumsq"] -= old * old
+            if old == st["min"] or old == st["max"]:
+                st["dirty"] = True
+
+        # Se min/max potenzialmente invalidi, ricalcola una volta (solo quando serve)
+        if st["dirty"]:
+            if dq:
+                vals = [v for _, v in dq]
+                st["min"] = min(vals)
+                st["max"] = max(vals)
+            st["dirty"] = False
+
+
+def _window_prune_to_now(key, now_epoch_sec):
+    """
+    Pruna la finestra in base al tempo corrente (utile se il flusher gira e arrivano pochi dati).
+    """
+    cutoff = float(now_epoch_sec) - STATS_WINDOW_SECONDS
+    st = _window_state.get(key)
+    if not st:
+        return
+
+    dq = st["dq"]
+    while dq and dq[0][0] < cutoff:
+        _, old = dq.popleft()
+        st["sum"] -= old
+        st["sumsq"] -= old * old
+        if old == st["min"] or old == st["max"]:
+            st["dirty"] = True
+
+    if st["dirty"]:
+        if dq:
+            vals = [v for _, v in dq]
+            st["min"] = min(vals)
+            st["max"] = max(vals)
+        st["dirty"] = False
+
+
+def _window_snapshot(key, now_epoch_sec):
+    """
+    Restituisce uno snapshot statistiche finestra: count/mean/min/max/std campionaria.
+    Pruna prima in base a now.
+    """
+    with _stats_lock:
+        if key not in _window_state:
+            return None
+
+        _window_prune_to_now(key, now_epoch_sec)
+        st = _window_state.get(key)
+        if not st:
+            return None
+
+        n = len(st["dq"])
+        if n <= 0:
+            return None
+
+        s = st["sum"]
+        ss = st["sumsq"]
+        mean = s / n
+
+        if n > 1:
+            # var campionaria = (Σx^2 - (Σx)^2/n)/(n-1)
+            var = (ss - (s * s) / n) / (n - 1)
+            if var < 0:
+                var = 0.0
+            std = math.sqrt(var)
+        else:
+            std = 0.0
+
+        return {
+            "seconds": STATS_WINDOW_SECONDS,
+            "count": n,
+            "mean": mean,
+            "min": st["min"],
+            "max": st["max"],
+            "std": std,
+            "updated_at": datetime.now(timezone.utc)
+        }
+
+def _window_snapshot_no_lock(key, now_epoch_sec):
+    """
+    Come _window_snapshot, ma ASSUME che _stats_lock sia già acquisito.
+    Serve per catturare uno snapshot coerente con lo swap del buffer.
+    """
+    if key not in _window_state:
+        return None
+
+    _window_prune_to_now(key, now_epoch_sec)
+    st = _window_state.get(key)
+    if not st:
+        return None
+
+    n = len(st["dq"])
+    if n <= 0:
+        return None
+
+    s = st["sum"]
+    ss = st["sumsq"]
+    mean = s / n
+
+    if n > 1:
+        var = (ss - (s * s) / n) / (n - 1)
+        if var < 0:
+            var = 0.0
+        std = math.sqrt(var)
+    else:
+        std = 0.0
+
+    return {
+        "seconds": STATS_WINDOW_SECONDS,
+        "count": n,
+        "mean": mean,
+        "min": st["min"],
+        "max": st["max"],
+        "std": std,
+        "updated_at": datetime.now(timezone.utc)
+    }
+
+
+def _buffer_update(user, session_id, sensor, valori):
+    """
+    Aggiorna il buffer in RAM con Welford incrementale per la chiave (user, session, sensor).
+    """
+    x = estrai_valore_numerico(sensor, valori)
+    if x is None:
+        return
+
+    key = (str(user).strip(), str(session_id).strip(), str(sensor).strip())
+    x = float(x)
+
+    with _stats_lock:
+        st = _stats_buffer.get(key)
+        if st is None:
+            _stats_buffer[key] = {
+                "user": key[0],
+                "session": key[1],
+                "sensor": key[2],
+                "n": 1,
+                "mean": x,
+                "m2": 0.0,
+                "min": x,
+                "max": x
+            }
+            return
+
+        n = st["n"]
+        mean = st["mean"]
+        m2 = st["m2"]
+
+        n_new = n + 1
+        delta = x - mean
+        mean_new = mean + delta / n_new
+        delta2 = x - mean_new
+        m2_new = m2 + delta * delta2
+
+        st["n"] = n_new
+        st["mean"] = mean_new
+        st["m2"] = m2_new
+        st["min"] = min(st["min"], x)
+        st["max"] = max(st["max"], x)
+
+
+@firestore.transactional
+def _merge_stats_tx(transaction, doc_ref, delta_stats, win_snapshot=None):
+    """
+    Merge su Firestore: unisce statistiche già presenti con il delta (buffer) via formule Welford.
+    """
+    snap = doc_ref.get(transaction=transaction)
+    now = datetime.now(timezone.utc)
+
+    n2 = int(delta_stats["n"])
+    mean2 = float(delta_stats["mean"])
+    m2_2 = float(delta_stats["m2"])
+    min2 = float(delta_stats["min"])
+    max2 = float(delta_stats["max"])
+
+    if not snap.exists:
+        n = n2
+        mean = mean2
+        m2 = m2_2
+        min_v = min2
+        max_v = max2
+    else:
+        st = snap.to_dict() or {}
+        n1 = int(st.get("count", 0))
+        mean1 = float(st.get("mean", 0.0))
+        m2_1 = float(st.get("m2", 0.0))
+        min1 = st.get("min", min2)
+        max1 = st.get("max", max2)
+
+        if n1 <= 0:
+            n = n2
+            mean = mean2
+            m2 = m2_2
+            min_v = min2
+            max_v = max2
+        else:
+            n = n1 + n2
+            delta = mean2 - mean1
+            mean = mean1 + delta * (n2 / n)
+            m2 = m2_1 + m2_2 + (delta * delta) * (n1 * n2 / n)
+
+            min_v = min(float(min1), min2) if min1 is not None else min2
+            max_v = max(float(max1), max2) if max1 is not None else max2
+
+    # std campionaria
+    if n > 1:
+        var = m2 / (n - 1)
+        std = math.sqrt(var) if var >= 0 else 0.0
+    else:
+        std = 0.0
+
+    payload = {
+        "user": delta_stats["user"],
+        "session": delta_stats["session"],
+        "sensor": delta_stats["sensor"],
+        "count": n,
+        "mean": mean,
+        "min": min_v,
+        "max": max_v,
+        "m2": m2,
+        "std": std,
+        "updated_at": now
+    }
+
+    # Aggiunge finestra mobile nello stesso documento (nessuna write extra)
+    if win_snapshot:
+        payload["win"] = win_snapshot
+
+    transaction.set(doc_ref, payload, merge=True)
+
+    return payload
+
+
+def _flush_stats_once():
+    """
+    Svuota il buffer in modo atomico e fa merge su Firestore.
+    Snapshot finestra e swap buffer sono coerenti nello stesso istante.
+    """
+    global _stats_buffer
+
+    with _stats_lock:
+        if not _stats_buffer:
+            return
+
+        # 1) Taglio temporale unico per buffer + finestra
+        now_epoch = time.time()
+
+        # 2) Congela buffer
+        to_flush = _stats_buffer
+        _stats_buffer = {}
+
+        # 3) Congela anche gli snapshot finestra per le stesse chiavi
+        win_snaps = {}
+        for key in to_flush.keys():
+            win_snaps[key] = _window_snapshot_no_lock(key, now_epoch)
+
+    # 4) I/O Firestore fuori dal lock
+    for (u, sess, sens), delta_stats in to_flush.items():
+        doc_id = f"{u}_{sess}_{sens}"
+        doc_ref = db.collection("statistiche").document(doc_id)
+
+        key = (u, sess, sens)
+        win_snap = win_snaps.get(key)
+
+        try:
+            tx = db.transaction()
+            merged_payload = _merge_stats_tx(tx, doc_ref, delta_stats, win_snapshot=win_snap)
+
+            # ✅ Valuta anomalia media (win.mean vs media globale appena calcolata)
+            thr, alerts = evaluate_mean_shift_alert(sens, merged_payload, win_snap)
+
+            # ✅ Warmup: niente notifiche nel primo minuto della sessione
+            if alerts and not _warmup_completed(u, sess, now_epoch):
+                remaining = _warmup_remaining_seconds(u, sess, now_epoch)
+                print(f"[WARMUP] Alert soppresso per {u}/{sess}/{sens}. Mancano {remaining}s.")
+                alerts = []
+
+            if alerts:
+                ctx = build_mean_shift_context(u, sess, sens, merged_payload, win_snap)
+
+                if ctx:
+                    text = format_telegram_anomaly_message(ctx)
+                else:
+                    # Fallback robusto
+                    session_label = session_label_from_session_id(u, sess)
+                    text = (
+                        f"⚠️ Anomalia rilevata\n"
+                        f"👤 Utente: {u}\n"
+                        f"🎚️ Intensità: {session_label}\n"
+                        f"📡 Sensore: {sens}\n"
+                        f"{alerts[0]}"
+                    )
+
+                # 1) Notifica a tutti gli admin
+                admin_chats = telegram_get_admin_chat_ids()
+                for chat_id in admin_chats:
+                    if _cooldown_allow(chat_id, u, sess, sens):
+                        telegram_send_message(chat_id, text)
+
+                # 2) Notifica all'utente (se loggato su Telegram)
+                user_chats = telegram_get_user_chat_ids(u)
+                for chat_id in user_chats:
+                    if _cooldown_allow(chat_id, u, sess, sens):
+                        telegram_send_message(chat_id, text)
+
+        except Exception as e:
+            print(f"[STATS] Errore flush {doc_id}: {e}")
+
+
+
+def _stats_flusher_loop():
+    # si sveglia ogni STATS_FLUSH_INTERVAL oppure prima se arriva stop_event
+    while not _stop_event.wait(STATS_FLUSH_INTERVAL):
+        _flush_stats_once()
+
+
+def start_stats_flusher():
+    """
+    Avvia il thread flusher UNA SOLA VOLTA.
+    Nota: con debug=True Flask avvia un reloader (2 processi). Evitiamo doppio thread.
+    """
+    global _flusher_started
+    if _flusher_started:
+        return
+
+    # Evita double-start col reloader
+    if app.debug and os.environ.get("WERKZEUG_RUN_MAIN") != "true":
+        return
+
+    global _flusher_thread
+
+    _flusher_started = True
+    _flusher_thread = threading.Thread(target=_stats_flusher_loop, daemon=True)
+    _flusher_thread.start()
+    print(f"[STATS] Flusher avviato. Interval={STATS_FLUSH_INTERVAL}s")
+
+def _clear_ram_state():
+    """
+    Svuota SOLO le strutture in RAM (nessun flush su Firestore).
+    """
+    global _stats_buffer, _window_state, _session_first_seen
+
+    with _stats_lock:
+        _stats_buffer = {}
+        _window_state = {}
+        _session_first_seen = {}
+
+    with _telegram_cooldown_lock:
+        _telegram_cooldown.clear()
+
+    with _pending_telegram_logins_lock:
+        _pending_telegram_logins.clear()
+
+    print("[STATS] Pulizia RAM completata: _stats_buffer, _window_state, _session_first_seen e _pending_telegram_logins svuotati.")
+
+def _shutdown_cleanup(exit_code=0):
+    """
+    Ferma il flusher e pulisce la RAM. NON salva su Firestore.
+    """
+    try:
+        _stop_event.set()
+    except Exception:
+        pass
+
+    try:
+        stop_telegram_polling()
+    except Exception:
+        pass
+
+    # pulizia RAM
+    try:
+        _clear_ram_state()
+    except Exception as e:
+        print(f"[STATS] Errore pulizia RAM: {e}")
+
+    # join thread best-effort
+    try:
+        global _flusher_thread
+        if _flusher_thread and _flusher_thread.is_alive():
+            _flusher_thread.join(timeout=2.0)
+    except Exception:
+        pass
+
+    if exit_code is not None:
+        raise SystemExit(exit_code)
+
+def _signal_handler(signum, frame):
+    print(f"[STATS] Ricevuto segnale {signum}. Pulizia RAM in corso...")
+    _shutdown_cleanup(exit_code=0)
+
+def register_shutdown_hooks():
+    """
+    Registra atexit + segnali.
+    In debug con reloader Flask (2 processi), registra SOLO nel processo 'vero'.
+    """
+    # Evita doppia registrazione col reloader (stessa logica usata nel flusher)
+    if app.debug and os.environ.get("WERKZEUG_RUN_MAIN") != "true":
+        return
+
+    atexit.register(lambda: _shutdown_cleanup(exit_code=None))
+
+    if threading.current_thread() is threading.main_thread():
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            try:
+                signal.signal(sig, _signal_handler)
+            except Exception as e:
+                print(f"[STATS] Impossibile registrare handler per {sig}: {e}")
+
+# --- GESTIONE DATI ---
+@app.route('/data', methods=['POST'])
+def receive_data():
+    data = request.json
+    if not data:
+        return jsonify({"status": "error", "message": "No data"}), 400
+
+    try:
+        raw_ts = data.get('timestamp')
+        ts_datetime = datetime.fromtimestamp(float(raw_ts) / 1000)
+        valori_data = data.get('data')
+
+        doc_ref = db.collection('dati_sensori').document()
+        doc_ref.set({
+            'user': data.get('user'),
+            'session': data.get('session'),
+            'sensor': data.get('sensor'),
+            'timestamp': ts_datetime,
+            'valori': valori_data,
+            'data_ricezione': datetime.now(timezone(timedelta(hours=2)))
+        })
+
+        # ✅ Segna l'inizio della sessione per warmup alert
+        try:
+            _mark_session_started(
+                user=data.get('user'),
+                session_id=data.get('session'),
+                now_epoch=time.time()
+            )
+        except Exception as e:
+            print(f"[WARMUP] Errore mark_session_started: {e}")
+
+        # ✅ STATISTICHE PRO: aggiorna buffer in RAM
+        try:
+            _buffer_update(
+                user=data.get('user'),
+                session_id=data.get('session'),
+                sensor=data.get('sensor'),
+                valori=valori_data
+            )
+        except Exception as e:
+            print(f"[STATS] Errore buffer_update: {e}")
+
+        # ✅ FINESTRA MOBILE
+        try:
+            _window_update(
+                user=data.get('user'),
+                session_id=data.get('session'),
+                sensor=data.get('sensor'),
+                valori=valori_data,
+                t_epoch_sec=time.time()
+            )
+        except Exception as e:
+            print(f"[STATS] Errore window_update: {e}")
+
+        return jsonify({"status": "success"}), 200
+
+    except Exception as e:
+        print(f"Errore DB: {e}")
+        return jsonify({"status": "error"}), 500
+
+# --- ROTTE AUTENTICAZIONE ---
+@app.route('/')
+def index():
+    return redirect(url_for('login'))
+
+@app.before_request
+def _ensure_stats_flusher():
+    start_stats_flusher()
+    start_telegram_polling()
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    error = False
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        tipo_scelto = request.form.get('tipo_utente')
+        
+        print(f"Tentativo di login per: {username}")
+        
+        try:
+            user_doc = db.collection('utenti').document(username).get()
+            
+            if user_doc.exists:
+                user_data = user_doc.to_dict()
+                print(f"Utente trovato in DB. Controllo password...")
+                
+                if str(user_data.get('password')) == str(password):
+                    session['user'] = username
+                    session['tipo'] = tipo_scelto
+                    session['id_utente'] = user_data.get('id_utente') # Salviamo l'id_utente (stringa)
+                    print("Login successo! Reindirizzamento...")
+                    
+                    if tipo_scelto == 'admin':
+                        return redirect(url_for('dashboard'))
+                    else:
+                        return redirect(url_for('dashboard_utente'))
+                else:
+                    print("Password errata.")
+                    error = True
+            else:
+                print("Utente non esistente su Firestore.")
+                error = True
+        except Exception as e:
+            print(f"Errore durante il login: {e}")
+            error = True
+
+    return render_template_string('''
+    <html>
+    <body style="font-family:sans-serif; display:flex; justify-content:center; align-items:center; height:100vh; background:#f0f2f5; margin:0;">
+        <form method="post" style="background:white; padding:2rem; border-radius:12px; box-shadow:0 10px 25px rgba(0,0,0,0.1); width:320px;">
+            <h2 style="color:#1a73e8; text-align:center;">Empatica E4 Login</h2>
+            <select name="tipo_utente" style="width:100%; margin-bottom:15px; padding:10px; border-radius:6px; border:1px solid #ddd;">
+                <option value="admin">Admin</option>
+                <option value="utente">Utente</option>
+            </select>
+            <input type="text" name="username" placeholder="Username" required style="width:100%; margin-bottom:15px; padding:10px; border-radius:6px; border:1px solid #ddd; box-sizing:border-box;">
+            <input type="password" name="password" placeholder="Password" required style="width:100%; margin-bottom:20px; padding:10px; border-radius:6px; border:1px solid #ddd; box-sizing:border-box;">
+            <input type="submit" value="Accedi" style="width:100%; padding:12px; background:#1a73e8; color:white; border:none; border-radius:6px; cursor:pointer; font-weight:bold;">
+            {% if error %}<p style="color:red; text-align:center; font-size:0.8rem; margin-top:10px;">Credenziali errate o errore server</p>{% endif %}
+        </form>
+    </body>
+    </html>
+    ''', error=error)
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
+
+@app.route("/api/registered_users")
+def api_registered_users():
+    """
+    Ritorna la lista degli id_utente registrati (stringhe), es: ["01","02",...].
+    Usato dal client per inviare dati solo agli utenti registrati.
+    """
+    try:
+        docs = db.collection("utenti").stream()
+        ids = set()
+
+        for d in docs:
+            u = d.to_dict() or {}
+            # Campo principale
+            if u.get("id_utente"):
+                ids.add(str(u["id_utente"]).strip())
+
+            # Fallback sul nome documento (opzionale)
+            ids.add(str(d.id).strip())
+
+        ids.discard("")  # rimuove stringhe vuote
+        return jsonify({"registered_ids": sorted(ids)}), 200
+
+    except Exception as e:
+        return jsonify({"registered_ids": [], "error": str(e)}), 500
+
+# --- ROTTA API LIVE_DATA SENZA INDICI ---
+@app.route('/api/live_data')
+def api_live_data():
+    if 'user' not in session or session.get('tipo') != 'admin':
+        return jsonify({"status": "error", "message": "Accesso negato"}), 403
+        
+    try:
+        # 1. Recuperiamo gli id_utente registrati
+        docs_utenti = db.collection('utenti').stream()
+        id_validi = set()
+        for d in docs_utenti:
+            u_data = d.to_dict()
+            id_u = u_data.get('id_utente')
+            if id_u:
+                id_validi.add(str(id_u).strip())
+            id_validi.add(str(d.id).strip()) # Sicurezza sul nome del documento
+            
+        if not id_validi:
+            return jsonify({"message": "Nessun utente registrato nel DB"}), 404
+
+        # 2. Query semplice (Usa solo l'ordinamento, QUINDI NO INDICI COMPOSITI)
+        # Recuperiamo gli ultimi 50 record arrivati in assoluto
+        query = db.collection('dati_sensori')\
+                  .order_by('data_ricezione', direction=firestore.Query.DESCENDING)\
+                  .limit(50)
+        
+        # 3. Filtriamo in Python anziché farlo fare a Firestore
+        ultimo_dato_valido = None
+        for doc in query.stream():
+            dati_doc = doc.to_dict()
+            user_del_dato = str(dati_doc.get('user', '')).strip()
+            
+            # Se l'utente che ha inviato questo dato fa parte di quelli registrati, abbiamo fatto centro!
+            if user_del_dato in id_validi:
+                ultimo_dato_valido = dati_doc
+                break # Ci fermiamo al primo (che è il più recente in assoluto)
+
+        if ultimo_dato_valido:
+            ts = ultimo_dato_valido.get('timestamp')
+            if ts and hasattr(ts, 'timestamp'):
+                ts_millisecondi = int(ts.timestamp() * 1000)
+            elif isinstance(ts, (int, float)):
+                ts_millisecondi = int(ts) if ts > 9999999999 else int(ts * 1000)
+            else:
+                ts_millisecondi = str(ts)
+            
+            return jsonify({
+                "utente": ultimo_dato_valido.get('user', 'N/D'),
+                "sessione": ultimo_dato_valido.get('session', 'N/D'),
+                "sensore": ultimo_dato_valido.get('sensor', 'N/D'),
+                "orario": ts_millisecondi,
+                "valori": ultimo_dato_valido.get('valori', {})
+            })
+        else:
+            return jsonify({"message": "Nessun dato recente per gli utenti registrati"}), 404
+            
+    except Exception as e:
+        print(f"Errore Live Data Software-Filtered: {e}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+# --- ROTTA PAGINA LIVE DATA (INTERFACCIA GRAFICA) ---
+@app.route('/live_admin')
+def live_admin():
+    if 'user' not in session or session.get('tipo') != 'admin':
+        return redirect(url_for('login'))
+        
+    return render_template_string(HTML_LIVE_DATA)
+
+# --- TEMPLATE SCHERMATA DATI IN TEMPO REALE ---
+HTML_LIVE_DATA = '''
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <title>Empatica E4 - Live Data</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f4f7f9; margin: 0; color: #333; }
+        .navbar { background: #1a73e8; color: white; padding: 15px 30px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .nav-links a { color: white; text-decoration: none; margin-left: 20px; font-weight: 500; font-size: 0.9rem; }
+        .nav-links a:hover { text-decoration: underline; }
+        
+        .container { max-width: 900px; margin: 50px auto; padding: 0 20px; }
+        .live-card { background: white; padding: 40px; border-radius: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.05); }
+        
+        h1 { color: #1a73e8; font-size: 2.5rem; margin-top: 0; margin-bottom: 30px; border-bottom: 2px solid #e8f0fe; padding-bottom: 15px; }
+        
+        .row { display: flex; margin-bottom: 25px; font-size: 1.2rem; align-items: center; }
+        .label { width: 180px; font-weight: bold; color: #555; }
+        .value { font-weight: 500; color: #000; }
+        .value.sensor { color: #d93025; font-weight: bold; } /* Colore rosso per il sensore come in foto */
+        
+        /* Modificato per ospitare i badge estetici senza sfondi grigi ereditati */
+        .value.json { font-family: sans-serif; background: transparent; padding: 0; border: none; }
+        
+        .footer-status { margin-top: 40px; color: #888; font-size: 0.9rem; font-style: italic; display: flex; align-items: center; gap: 8px; }
+        .dot { width: 8px; height: 8px; background-color: #34a853; border-radius: 50%; display: inline-block; animation: blink 1.5s infinite; }
+        
+        @keyframes blink { 0% { opacity: 0.3; } 50% { opacity: 1; } 100% { opacity: 0.3; } }
+    </style>
+</head>
+<body>
+    <div class="navbar">
+        <h2 style="margin:0; font-size: 1.4rem;">Empatica E4 Dashboard</h2>
+        <div class="nav-links">
+            <a href="/dashboard_admin">Dashboard</a>
+            <a href="/live_admin" style="text-decoration: underline;">Dati in tempo reale</a>
+            <a href="/register">Nuovo Utente</a>
+            <a href="/logout" style="color: #ffcccc;">Logout</a>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="live-card">
+            <h1>Empatica E4 wristband</h1>
+            
+            <div class="row">
+                <div class="label">Utente:</div>
+                <div class="value" id="lblUtente">--</div>
+            </div>
+            
+            <div class="row">
+                <div class="label">Sessione:</div>
+                <div class="value" id="lblSessione">--</div>
+            </div>
+            
+            <div class="row">
+                <div class="label">Sensore:</div>
+                <div class="value sensor" id="lblSensore">--</div>
+            </div>
+            
+            <div class="row">
+                <div class="label">Orario:</div>
+                <div class="value" id="lblOrario">--</div>
+            </div>
+            
+            <div class="row" style="align-items: flex-start;">
+                <div class="label" style="margin-top: 8px;">Dati ricevuti:</div>
+                <div class="value json" id="lblDati">{}</div>
+            </div>
+            
+            <div class="footer-status">
+                <span class="dot"></span> Aggiornamento automatico attivo...
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function formattaOrario(timestampMillisecondi) {
+            if (!timestampMillisecondi || isNaN(timestampMillisecondi)) return "--:--:--";
+            const data = new Date(Number(timestampMillisecondi));
+            
+            const ore = String(data.getHours()).padStart(2, '0');
+            const minuti = String(data.getMinutes()).padStart(2, '0');
+            const secondi = String(data.getSeconds()).padStart(2, '0');
+            
+            return `${ore}:${minuti}:${secondi}`;
+        }
+
+        function generaBadgeDati(valori) {
+            if (!valori || typeof valori !== 'object' || Object.keys(valori).length === 0) return '{}';
+            
+            let htmlBadges = '<div style="display: flex; gap: 10px; flex-wrap: wrap;">';
+            
+            for (const [chiave, valore] of Object.entries(valori)) {
+                htmlBadges += `
+                    <span style="
+                        background: #e8f0fe; 
+                        color: #1a73e8; 
+                        padding: 6px 14px; 
+                        border-radius: 20px; 
+                        font-weight: 600; 
+                        font-size: 0.95rem;
+                        border: 1px solid #c2dbff;
+                        font-family: sans-serif;
+                    ">
+                        <strong style="color: #555; margin-right: 4px;">${chiave}:</strong>${valore}
+                    </span>`;
+            }
+            
+            htmlBadges += '</div>';
+            return htmlBadges;
+        }
+
+        function caricaDatoRealTime() {
+            fetch('/api/live_data')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status !== "error" && !data.message) {
+                        document.getElementById('lblUtente').innerText = data.utente;
+                        document.getElementById('lblSessione').innerText = data.sessione;
+                        document.getElementById('lblSensore').innerText = data.sensore;
+                        
+                        // 1. Stampa l'orario convertito in formato HH:MM:SS
+                        document.getElementById('lblOrario').innerText = formattaOrario(data.orario);
+                        
+                        // 2. Stampa i dati formattati in badge eleganti anziché stringhe
+                        document.getElementById('lblDati').innerHTML = generaBadgeDati(data.valori);
+                    }
+                })
+                .catch(err => console.error("Errore fetch dati live:", err));
+        }
+
+        // Esegue il fetch subito all'avvio e poi ogni 1000 millisecondi (1 secondo)
+        caricaDatoRealTime();
+        setInterval(caricaDatoRealTime, 1000);
+    </script>
+</body>
+</html>
+'''
+
+@app.route('/dashboard_admin')
+def dashboard():
+    if 'user' not in session or session.get('tipo') != 'admin':
+        return redirect(url_for('login'))
+
+    print(f"DEBUG: Accesso dashboard per l'utente {session['user']}")
+
+    try:
+        # MODIFICA: Recuperiamo la lista degli utenti direttamente dalla collezione 'utenti'
+        try:
+            docs_u = db.collection('utenti').stream()
+            # Estraiamo l'id_utente di ogni documento (es: "01", "02", ecc.) 
+            # che è quello usato nella collezione 'dati_sensori'
+            lista_utenti = sorted(list(set([d.to_dict().get('id_utente') for d in docs_u if d.to_dict().get('id_utente')])))
+        except Exception as e:
+            print(f"Errore recupero utenti dal DB utenti: {e}")
+            lista_utenti = []
+
+        if not lista_utenti:
+            lista_utenti = ["Nessun utente creato"]
+
+        # Se l'admin non ha selezionato nulla dal menu a tendina, prendiamo il primo utente della lista
+        selected_user = request.args.get('u', lista_utenti[0])
+
+        session_options = build_session_options_for_user(selected_user)
+        default_sess = session_options[0][1]  # session id di "basso"
+        selected_sess = request.args.get('s', default_sess)
+        
+        data_charts = recupera_dati_grafici(selected_user, selected_sess)
+
+        return render_template_string(
+            HTML_DASHBOARD_ORIGINALE,
+            utenti=lista_utenti,
+            selected_u=selected_user,
+            selected_s=selected_sess,
+            data_charts=data_charts,
+            session_options=session_options
+        )
+
+    except Exception as e:
+        print(f"ERRORE FATALE: {e}")
+        return f"<h1>Errore di caricamento</h1><p>{e}</p><a href='/logout'>Torna al login</a>"
+
+@app.route('/statistics_admin')
+def statistics_admin():
+    if 'user' not in session or session.get('tipo') != 'admin':
+        return redirect(url_for('login'))
+
+    # Recupera utenti dalla collezione 'utenti'
+    try:
+        docs_u = db.collection('utenti').stream()
+        lista_utenti = sorted(list(set([
+            d.to_dict().get('id_utente')
+            for d in docs_u
+            if d.to_dict().get('id_utente')
+        ])))
+    except Exception as e:
+        print(f"Errore recupero utenti: {e}")
+        lista_utenti = []
+
+    if not lista_utenti:
+        lista_utenti = ["Nessun utente creato"]
+
+    selected_user = request.args.get('u', lista_utenti[0])
+
+    session_options = build_session_options_for_user(selected_user)
+    default_sess = session_options[0][1]
+    selected_sess = request.args.get('s', default_sess)
+
+    selected_session_label = session_label_from_session_id(selected_user, selected_sess)
+
+    sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
+
+    stats = {}
+    mean_shift_thr_view = {}
+    mean_shift_alerts_view = {}
+
+    for s in sensori:
+        doc_id = f"{str(selected_user).strip()}_{str(selected_sess).strip()}_{s}"
+        doc = db.collection("statistiche").document(doc_id).get()
+        st = doc.to_dict() if doc.exists else None
+        stats[s] = st
+
+        win = st.get("win") if st else None
+
+        mean_thr, mean_alerts = evaluate_mean_shift_alert(s, st, win)
+        mean_shift_thr_view[s] = mean_thr
+
+        if mean_alerts and st and win:
+            ctx = build_mean_shift_context(selected_user, selected_sess, s, st, win)
+            if ctx:
+                mean_shift_alerts_view[s] = [format_web_anomaly_message(ctx)]
+            else:
+                mean_shift_alerts_view[s] = mean_alerts
+        else:
+            mean_shift_alerts_view[s] = []
+
+    return render_template_string(
+        HTML_STATISTICHE,
+        utenti=lista_utenti,
+        selected_u=selected_user,
+        selected_s=selected_sess,
+        selected_session_label=selected_session_label,
+        stats=stats,
+        interval=int(STATS_FLUSH_INTERVAL),
+        session_options=session_options,
+        mean_shift_thr_view=mean_shift_thr_view,
+        mean_shift_alerts_view=mean_shift_alerts_view,
+        warmup_seconds=WARMUP_SECONDS
+    )
+
+# --- ROTTA DASHBOARD UTENTE ---
+@app.route('/dashboard_utente')
+def dashboard_utente():
+    if 'user' not in session or session.get('tipo') != 'utente':
+        return redirect(url_for('login'))
+
+    mio_id = session.get('id_utente')
+
+    session_options = build_session_options_for_user(mio_id)
+    default_sess = session_options[0][1]
+    selected_sess = request.args.get('s', default_sess)
+    
+    data_charts = recupera_dati_grafici(mio_id, selected_sess)
+
+    # Passiamo in utenti solo una lista con il proprio ID per far funzionare il render senza errori
+    return render_template_string(HTML_DASHBOARD_ORIGINALE, utenti=[mio_id], selected_u=mio_id, selected_s=selected_sess, data_charts=data_charts, session_options=session_options)
+
+# --- FUNZIONE REFACTOR PER RECUPERO DATI ---
+def recupera_dati_grafici(target_user, session_id):
+    sensori = ["ACC", "BVP", "EDA", "HR", "IBI", "TEMP"]
+    data_charts = {}
+    for s in sensori:
+        try:
+            query = db.collection('dati_sensori')\
+                      .where('user', '==', str(target_user))\
+                      .where('sensor', '==', s)\
+                      .where('session', '==', session_id)\
+                      .order_by('timestamp', direction=firestore.Query.DESCENDING)\
+                      .limit(40)
+            
+            results = [d.to_dict() for d in query.stream()]
+            results.reverse()
+            
+            labels = []
+            for r in results:
+                ts = r.get('timestamp')
+                if ts and hasattr(ts, 'strftime'):
+                    labels.append(ts.strftime('%H:%M:%S'))
+                else:
+                    labels.append(str(ts))
+            
+            values = []
+            for r in results:
+                val_raw = r.get('valori', '{}')
+                val = json.loads(val_raw.replace("'", '"')) if isinstance(val_raw, str) else val_raw
+                
+                if s == "ACC":
+                    ax = float(val.get('ax', val.get('x', 0)))
+                    ay = float(val.get('ay', val.get('y', 0)))
+                    az = float(val.get('az', val.get('z', 0)))
+                    mag = math.sqrt(ax**2 + ay**2 + az**2)
+                    # ✅ indice attività coerente con estrai_valore_numerico(): abs(mag - 1.0)
+                    values.append(round(abs(mag - 1.0), 3))
+                else:
+                    raw_value = float(next(iter(val.values()), 0))
+
+                    # ✅ Coerenza totale per BVP: grafico su mean|BVP| (qui abs del singolo campione)
+                    if s == "BVP":
+                        values.append(abs(raw_value))
+                    else:
+                        values.append(raw_value)
+
+            
+            data_charts[s] = {"labels": labels, "values": values}
+        except Exception as e:
+            print(f"Errore sensore {s}: {e}")
+            data_charts[s] = {"labels": [], "values": []}
+    return data_charts
+
+# --- ROTTA REGISTRAZIONE ---
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if 'user' not in session or session.get('tipo') != 'admin':
+        return "Accesso negato.", 403
+
+    message = ""
+    if request.method == 'POST':
+        username = request.form.get('username')
+        user_ref = db.collection('utenti').document(username)
+
+        if not user_ref.get().exists:
+            low_s = str(request.form.get("low_session", "")).strip()
+            med_s = str(request.form.get("medium_session", "")).strip()
+            high_s = str(request.form.get("high_session", "")).strip()
+
+            chosen = [low_s, med_s, high_s]
+
+            # ✅ vincolo: permutazione (tutti diversi)
+            if any(x not in ("01", "02", "03") for x in chosen) or len(set(chosen)) != 3:
+                message = "Errore: seleziona una permutazione valida (01/02/03) per basso/medio/alto."
+            else:
+                user_ref.set({
+                    'username': username,
+                    'password': request.form.get('password'),
+                    'id_utente': request.form.get('id_utente'),
+                    'cellulare': request.form.get('cellulare'),
+                    'low_session': low_s,
+                    'medium_session': med_s,
+                    'high_session': high_s
+                })
+                message = f"Utente {username} registrato con successo!"
+        else:
+            message = "Errore: Lo username esiste già."
+
+    return render_template_string('''
+    <html>
+    <body style="font-family:sans-serif; background:#f0f2f5; display:flex; justify-content:center; align-items:center; height:100vh; margin:0;">
+        <div style="background:white; padding:2rem; border-radius:12px; box-shadow:0 10px 25px rgba(0,0,0,0.1); width:350px;">
+            <h2 style="color:#1a73e8; margin-top:0; text-align:center;">Registrazione Utente</h2>
+            {% if msg %}<div style="padding:10px; margin-bottom:15px; border-radius:6px; background:#e8f0fe; color:#1a73e8; font-size:0.9rem; text-align:center;">{{ msg }}</div>{% endif %}
+            <form method="post">
+                <label style="font-size:0.85rem; color:#555;">Username:</label>
+                <input type="text" name="username" required style="width:100%; margin-bottom:15px; padding:10px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;">
+                <label style="font-size:0.85rem; color:#555;">Password:</label>
+                <input type="password" name="password" required style="width:100%; margin-bottom:15px; padding:10px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;">
+                <label style="font-size:0.85rem; color:#555;">ID Utente :</label>
+                <input type="text" name="id_utente" placeholder="Es: 02" required style="width:100%; margin-bottom:15px; padding:10px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;">
+                <label style="font-size:0.85rem; color:#555;">Cellulare:</label>
+                <input type="text" name="cellulare" style="width:100%; margin-bottom:20px; padding:10px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;">
+
+                <label style="font-size:0.85rem; color:#555;">Sessione BASSO (low):</label>
+                <select name="low_session" required style="width:100%; margin-bottom:15px; padding:10px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;">
+                <option value="01">01</option>
+                <option value="02">02</option>
+                <option value="03">03</option>
+                </select>
+
+                <label style="font-size:0.85rem; color:#555;">Sessione MEDIO (medium):</label>
+                <select name="medium_session" required style="width:100%; margin-bottom:15px; padding:10px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;">
+                <option value="01">01</option>
+                <option value="02">02</option>
+                <option value="03">03</option>
+                </select>
+
+                <label style="font-size:0.85rem; color:#555;">Sessione ALTO (high):</label>
+                <select name="high_session" required style="width:100%; margin-bottom:15px; padding:10px; border:1px solid #ddd; border-radius:6px; box-sizing:border-box;">
+                <option value="01">01</option>
+                <option value="02">02</option>
+                <option value="03">03</option>
+                </select>
+
+
+                <input type="submit" value="Registra Utente" style="width:100%; padding:12px; background:#1a73e8; color:white; border:none; border-radius:6px; cursor:pointer; font-weight:bold;">
+            </form>
+            <div style="text-align:center; margin-top:15px;"><a href="/dashboard_admin" style="color:#666; font-size:0.85rem; text-decoration:none;">← Dashboard</a></div>
+        </div>
+    </body>
+    </html>
+    ''', msg=message)
+
+
+# --- TEMPLATE HTML ORIGINALE PRESERVATO PARI PARI ---
+HTML_DASHBOARD_ORIGINALE = '''
+<!DOCTYPE html>
+<html lang="it">
+<head>
+    <meta charset="UTF-8">
+    <title>Empatica E4 - Dashboard</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f4f7f9; margin: 0; color: #333; }
+        .navbar { background: #1a73e8; color: white; padding: 15px 30px; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .container { max-width: 1100px; margin: 30px auto; padding: 0 20px; }
+        .card-controls { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.05); margin-bottom: 25px; display: flex; gap: 20px; align-items: center; }
+        select { padding: 10px; border-radius: 5px; border: 1px solid #ddd; font-size: 14px; background: white; }
+        .chart-container { background: white; padding: 25px; border-radius: 12px; box-shadow: 0 10px 20px rgba(0,0,0,0.05); height: 500px; }
+        .nav-links a { color: white; text-decoration: none; margin-left: 20px; font-weight: 500; font-size: 0.9rem; }
+        .nav-links a:hover { text-decoration: underline; }
+        h3 { margin-top: 0; color: #1a73e8; }
+    </style>
+</head>
+<body>
+    <div class="navbar">
+        <h2 style="margin:0; font-size: 1.4rem;">Empatica E4 Dashboard</h2>
+        <div class="nav-links">
+            {% if session['tipo'] == 'admin' %}
+                <a href="/dashboard_admin">Dashboard</a>
+                <a href="/live_admin">Dati in tempo reale</a>
+                <a href="/statistics_admin">Statistiche</a>
+                <a href="/register">Nuovo Utente</a>
+            {% else %}
+                <a href="/dashboard_utente">Dashboard</a>
+            {% endif %}
+            <a href="/logout" style="color: #ffcccc;">Logout</a>
+        </div>
+    </div>
+
+    <div class="container">
+        <div class="card-controls">
+            {% if session['tipo'] == 'admin' %}
+            <div>
+                <label><b>Utente:</b></label>
+                <select id="userSelect" onchange="update()">
+                    {% for u in utenti %}
+                    <option value="{{ u }}" {% if u == selected_u %}selected{% endif %}>{{ u }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            {% else %}
+            <div>
+                <label><b>ID Utente:</b> {{ session['id_utente'] }}</label>
+            </div>
+            {% endif %}
+            
+            <div>
+                <label><b>Sensore:</b></label>
+                <select id="sensorSelect" onchange="changeSensor()">
+                    <option value="ACC">Accelerometro (Magnitudo)</option>
+                    <option value="BVP">BVP (Blood Volume Pulse)</option>
+                    <option value="EDA">EDA (Elettrodermica)</option>
+                    <option value="HR">Frequenza Cardiaca (HR)</option>
+                    <option value="IBI">IBI (Inter-Beat Interval)</option>
+                    <option value="TEMP">Temperatura</option>
+                </select>
+            </div>
+            <div>
+                <label><b>Sessione:</b></label>
+                <select id="sessSelect" onchange="update()">
+                {% for label, sessid in session_options %}
+                    <option value="{{ sessid }}" {% if sessid == selected_s %}selected{% endif %}>{{ label }}</option>
+                {% endfor %}
+                </select>
+            </div>
+        </div>
+
+        <div class="chart-container">
+            <h3 id="chartTitle">Caricamento grafico...</h3>
+            <div style="height: 400px; position: relative;">
+                <canvas id="mainChart"></canvas>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const allData = {{ data_charts|tojson }};
+        let currentChart = null;
+
+        function render(sensorId) {
+            const ctx = document.getElementById('mainChart').getContext('2d');
+            const data = allData[sensorId];
+            
+            document.getElementById('chartTitle').innerText = sensorId + " - Dati in tempo reale";
+
+            if (currentChart) currentChart.destroy();
+
+            currentChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: data.labels,
+                    datasets: [{
+                        label: sensorId,
+                        data: data.values,
+                        borderColor: '#1a73e8',
+                        backgroundColor: 'rgba(26, 115, 232, 0.1)',
+                        borderWidth: 3,
+                        tension: 0.4,
+                        fill: true,
+                        pointRadius: 3
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: { y: { beginAtZero: false, grid: { color: '#f0f0f0' } }, x: { grid: { display: false } } }
+                }
+            });
+        }
+
+        function update() {
+            const s = document.getElementById('sessSelect').value;
+            
+            // Gestione URL dinamica basata sul ruolo per non rompere il refresh/update
+            if ("{{ session['tipo'] }}" === "admin") {
+                const u = document.getElementById('userSelect').value;
+                window.location.href = `/dashboard_admin?u=${u}&s=${s}`;
+            } else {
+                window.location.href = `/dashboard_utente?s=${s}`;
+            }
+        }
+
+        function changeSensor() {
+            const s = document.getElementById('sensorSelect').value;
+            localStorage.setItem('lastSensor', s);
+            render(s);
+        }
+
+        window.onload = () => {
+            const last = localStorage.getItem('lastSensor') || 'HR';
+            document.getElementById('sensorSelect').value = last;
+            render(last);
+        };
+
+        setTimeout(() => location.reload(), 20000);
+    </script>
+</body>
+</html>
+'''
+
+HTML_STATISTICHE = '''
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <title>Empatica E4 - Statistiche</title>
+  <style>
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f4f7f9; margin: 0; color: #333; }
+    .navbar { background: #1a73e8; color: white; padding: 15px 30px; display:flex; justify-content:space-between; align-items:center; box-shadow:0 2px 5px rgba(0,0,0,0.1); }
+    .nav-links a { color:white; text-decoration:none; margin-left:20px; font-weight:500; font-size:0.9rem; }
+    .nav-links a:hover { text-decoration: underline; }
+
+    .container { max-width: 1100px; margin: 30px auto; padding: 0 20px; }
+    .card-controls {
+      background:white;
+      padding:20px;
+      border-radius:10px;
+      box-shadow:0 4px 6px rgba(0,0,0,0.05);
+      margin-bottom:25px;
+      display:flex;
+      gap:20px;
+      align-items:center;
+      flex-wrap: wrap;
+    }
+
+    select { padding:10px; border-radius:5px; border:1px solid #ddd; font-size:14px; background:white; }
+
+    .grid { display:grid; grid-template-columns: repeat(3, 1fr); gap:16px; }
+
+    .card {
+      background:white;
+      padding:18px;
+      border-radius:12px;
+      box-shadow:0 10px 20px rgba(0,0,0,0.05);
+    }
+
+    .title { color:#1a73e8; font-weight:700; margin:0 0 10px; }
+
+    .kpi { display:flex; flex-direction:column; gap:6px; font-size:0.95rem; }
+    .kpi b { color:#555; width:120px; display:inline-block; }
+
+    .muted { color:#888; font-style:italic; }
+
+    .pill {
+      display:inline-block;
+      padding:6px 10px;
+      border-radius:999px;
+      background:#e8f0fe;
+      color:#1a73e8;
+      font-weight:600;
+      font-size:0.85rem;
+    }
+
+    .alert-box {
+      margin-top:12px;
+      padding:12px 14px;
+      border-radius:10px;
+      background:#fdecec;
+      border:1px solid #f5c2c2;
+      color:#b3261e;
+    }
+
+    .alert-title {
+      font-weight:700;
+      margin-bottom:6px;
+    }
+
+    .alert-text {
+      font-size:0.95rem;
+      line-height:1.5;
+    }
+
+    @media (max-width: 980px) {
+      .grid { grid-template-columns: repeat(2, 1fr); }
+    }
+
+    @media (max-width: 640px) {
+      .grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+
+  <div class="navbar">
+    <h2 style="margin:0; font-size: 1.4rem;">Empatica E4 Dashboard</h2>
+    <div class="nav-links">
+      <a href="/dashboard_admin">Dashboard</a>
+      <a href="/live_admin">Dati in tempo reale</a>
+      <a href="/statistics_admin" style="text-decoration: underline;">Statistiche</a>
+      <a href="/register">Nuovo Utente</a>
+      <a href="/logout" style="color:#ffcccc;">Logout</a>
+    </div>
+  </div>
+
+  <div class="container">
+    <div class="card-controls">
+      <div>
+        <label><b>Utente:</b></label>
+        <select id="userSelect" onchange="update()">
+          {% for u in utenti %}
+            <option value="{{ u }}" {% if u == selected_u %}selected{% endif %}>{{ u }}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div>
+        <label><b>Sessione:</b></label>
+        <select id="sessSelect" onchange="update()">
+        {% for label, sessid in session_options %}
+            <option value="{{ sessid }}" {% if sessid == selected_s %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+        </select>
+      </div>
+
+      <span class="pill">Intensità selezionata: {{ selected_session_label }}</span>
+      <span class="pill">Flush stats ~ ogni {{ interval }}s</span>
+      <span class="pill">Warmup alert Telegram: {{ warmup_seconds }}s</span>
+      <span class="pill">Cooldown stesso alert Telegram: 20s</span>
+      <span class="muted">Se non vedi valori, attendi qualche secondo (buffer RAM).</span>
+    </div>
+
+    <div class="grid">
+    {% for sensor, st in stats.items() %}
+        <div class="card">
+        <h3 class="title">{{ sensor }}</h3>
+
+        {% if st %}
+            <div class="kpi">
+              <div><b>Campioni:</b> {{ st.count }}</div>
+              <div><b>Media:</b> {{ '%.3f'|format(st.mean) }}</div>
+              <div><b>Min:</b> {{ '%.3f'|format(st.min) }}</div>
+              <div><b>Max:</b> {{ '%.3f'|format(st.max) }}</div>
+              <div><b>Dev Std:</b> {{ '%.3f'|format(st.std) }}</div>
+              <div class="muted">Ultimo update: {{ st.updated_at }}</div>
+
+              {% if st.win %}
+                <hr style="border:none; border-top:1px solid #eee; margin:12px 0;">
+                <div class="muted" style="margin-bottom:6px;">
+                  Finestra mobile ultimi {{ st.win.seconds }}s
+                </div>
+
+                <div class="kpi">
+                  <div><b>Campioni:</b> {{ st.win.count }}</div>
+                  <div><b>Media:</b> {{ '%.3f'|format(st.win.mean) }}</div>
+                  <div><b>Min:</b> {{ '%.3f'|format(st.win.min) }}</div>
+                  <div><b>Max:</b> {{ '%.3f'|format(st.win.max) }}</div>
+                  <div><b>Dev Std:</b> {{ '%.3f'|format(st.win.std) }}</div>
+                  <div class="muted">Update finestra: {{ st.win.updated_at }}</div>
+                </div>
+              {% else %}
+                <div class="muted" style="margin-top:10px;">
+                  Finestra mobile: in attesa dati/flush...
+                </div>
+              {% endif %}
+
+              {% set mean_thr = mean_shift_thr_view[sensor] %}
+              {% set mean_al  = mean_shift_alerts_view[sensor] %}
+
+              <hr style="border:none; border-top:1px solid #eee; margin:12px 0;">
+
+              <div class="muted" style="margin-bottom:6px;">
+                Anomalia media (finestra vs globale):
+                {% if mean_thr is not none %}
+                  soglia = ±{{ '%.2f'|format(mean_thr) }}%
+                {% else %}
+                  (non definita)
+                {% endif %}
+              </div>
+
+              {% if mean_al and mean_al|length > 0 %}
+                <div class="alert-box">
+                  <div class="alert-title">⚠ Superamento soglia</div>
+                  <div class="alert-text">{{ mean_al[0] }}</div>
+                </div>
+              {% else %}
+                <div class="muted" style="margin-top:10px;">
+                  Media finestra coerente con media globale.
+                </div>
+              {% endif %}
+
+            </div>
+
+        {% else %}
+            <div class="muted">
+              Nessuna statistica disponibile (ancora in accumulo o nessun dato).
+            </div>
+        {% endif %}
+        </div>
+    {% endfor %}
+    </div>
+  </div>
+
+<script>
+  function update() {
+    const u = document.getElementById('userSelect').value;
+    const s = document.getElementById('sessSelect').value;
+    window.location.href = `/statistics_admin?u=${u}&s=${s}`;
+  }
+  setTimeout(() => location.reload(), 5000);
+</script>
+
+</body>
+</html>
+'''
+
+
+
+if __name__ == '__main__':
+    app.debug = True
+    register_shutdown_hooks()
+    start_telegram_polling()
+    app.run(host='0.0.0.0', port=5000, debug=True)
