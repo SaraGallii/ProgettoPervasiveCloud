@@ -37,9 +37,47 @@ class FatigueSetClient:
         except FileNotFoundError:
             pass 
 
-def avvia_simulazione_globale(base_dir, server_url):
+
+def scan_dataset(base_dir, sensor_configs):
+    """
+    Ritorna: dict user_id -> list of (full_path, sensor_name, interval)
+    assumendo struttura: base_dir/<user_id>/<session_id>/<file>
+    """
+    user_files = {}
+
+    for root, dirs, files in os.walk(base_dir):
+        for file_name in files:
+            if file_name in sensor_configs:
+                conf = sensor_configs[file_name]
+                full_path = os.path.join(root, file_name)
+
+                parts = full_path.split(os.sep)
+                user_id = parts[-3] if len(parts) >= 3 else "unknown"
+
+                user_files.setdefault(user_id, []).append(
+                    (full_path, conf["name"], conf["int"])
+                )
+
+    return user_files
+
+
+def fetch_registered_ids(server_base):
+    """
+    Chiama il server e recupera gli utenti registrati.
+    server_base: es. http://34.154.16.97:5000
+    """
+    try:
+        r = requests.get(f"{server_base}/api/registered_users", timeout=3)
+        data = r.json()
+        ids = data.get("registered_ids", [])
+        return set(str(x).strip() for x in ids if str(x).strip())
+    except Exception:
+        return set()
+
+
+def avvia_simulazione_globale(base_dir, server_url, poll_seconds=5):
     client = FatigueSetClient(server_url)
-    
+
     sensor_configs = {
         "wrist_acc.csv": {"name": "ACC", "int": 0.031},
         "wrist_bvp.csv": {"name": "BVP", "int": 0.015},
@@ -49,34 +87,56 @@ def avvia_simulazione_globale(base_dir, server_url):
         "wrist_skin_temperature.csv": {"name": "TEMP", "int": 0.25}
     }
 
+    # 1) Indicizza dataset per utente
+    user_files = scan_dataset(base_dir, sensor_configs)
+    print(f"[INFO] Dataset indicizzato. Utenti trovati nel dataset: {len(user_files)}")
+
+    # 2) Calcola server_base (rimuove /data)
+    #    es: http://34.154.16.97:5000/data -> http://34.154.16.97:5000
+    server_base = server_url.rsplit("/", 1)[0]
+
+    started_users = set()
     threads = []
 
-    for root, dirs, files in os.walk(base_dir):
-        for file_name in files:
-            if file_name in sensor_configs:
-                conf = sensor_configs[file_name]
-                full_path = os.path.join(root, file_name)
-                
-                # Creiamo un thread per ogni file trovato
+    print("[INFO] In attesa utenti registrati... (polling)")
+
+    while True:
+        registered = fetch_registered_ids(server_base)
+
+        # Avvia SOLO gli utenti registrati (e non ancora avviati)
+        for user_id in registered:
+            if user_id in started_users:
+                continue
+
+            if user_id not in user_files:
+                # Utente registrato ma non presente nel dataset locale
+                continue
+
+            print(f"[INFO] Utente {user_id} registrato: avvio invio dati.")
+            started_users.add(user_id)
+
+            # Avvia i thread per tutti i sensori di quell'utente
+            for (full_path, sensor_name, interval) in user_files[user_id]:
                 t = threading.Thread(
-                    target=client.send_data, 
-                    args=(full_path, conf["name"], conf["int"]),
-                    daemon=True 
+                    target=client.send_data,
+                    args=(full_path, sensor_name, interval),
+                    daemon=True
                 )
                 threads.append(t)
                 t.start()
 
-    print(f"[INFO] Lanciati {len(threads)} thread di monitoraggio.")
-    
-    for t in threads: #Aggiorna programma principale
+        # Se vuoi chiudere quando hai avviato tutti gli utenti presenti nel dataset:
+        # if started_users.issuperset(set(user_files.keys())):
+        #     break
+
+        time.sleep(poll_seconds)
+
+    # (Di solito non ci arrivi se lasci il while True)
+    for t in threads:
         t.join()
 
 if __name__ == "__main__":
     SERVER_URL = "http://34.154.16.97:5000/data"
-    # Percorso assoluto
-    # DATASET_PATH = r"C:\Users\galli\OneDrive\Desktop\fatigueset"  
-
-    # Percorso relativo
     DATASET_PATH = r"fatigueset"
-    
-    avvia_simulazione_globale(DATASET_PATH, SERVER_URL)
+
+    avvia_simulazione_globale(DATASET_PATH, SERVER_URL, poll_seconds=5)

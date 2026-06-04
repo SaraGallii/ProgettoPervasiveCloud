@@ -1,2 +1,6 @@
-venv\
-credentials.json
+__pycache__/
+venv/
+.venv/
+.env
+progetto-pcloud-5-b8e46802d217.json
+*.json

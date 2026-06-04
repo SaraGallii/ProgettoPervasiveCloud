@@ -1,4 +1,4 @@
-flask
-requests
-google-cloud-storage
+Flask
+python-dateutil
 google-cloud-firestore
+requests
